@@ -1,1 +1,1 @@
-"""AI provider abstractions and scaffolding."""
+"""AI provider abstractions, clients, and scaffolding."""

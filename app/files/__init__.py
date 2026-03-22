@@ -1,1 +1,1 @@
-"""Approved folder registry and file scaffolding."""
+"""Approved folder registry and file operation services."""
