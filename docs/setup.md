@@ -8,8 +8,17 @@
 5. Launch the app with `python -m app.main`.
 6. Complete the first-run setup wizard.
 
-## Current Phase 1 behavior
+## Yahoo Mail setup
+1. Open Yahoo account security settings.
+2. Generate a Yahoo app password for this app.
+3. Enter your Yahoo email address and the Yahoo app password in the setup wizard or the Yahoo Mail tab.
+4. Leave the default Yahoo IMAP/SMTP servers unless you have a specific reason to change them.
+5. Click **Test Yahoo connection** before trying inbox search or sending mail.
+
+## Current behavior
 - Stores settings in a local SQLite database.
 - Stores an application log file in the app data directory.
-- Lets the user choose AI mode scaffolding and approved folders.
-- Does not yet connect to Yahoo Mail or AI providers.
+- Lets the user choose AI mode and approved folders.
+- Connects to Yahoo Mail with IMAP for reading/search and SMTP for sending.
+- Requires explicit confirmation before sending email.
+- Still allows Yahoo mail listing/search/reading and file operations when AI is not configured.

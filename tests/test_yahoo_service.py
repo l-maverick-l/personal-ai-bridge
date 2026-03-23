@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import sqlite3
+import unittest
+from email.message import EmailMessage
+
+from app.ai.client import AIClient
+from app.data.action_log import ActionLogger
+from app.data.database import initialize_database
+from app.data.settings_store import SettingsStore
+from app.email.yahoo_service import OutgoingDraft, YahooMailError, YahooMailService
+from app.models.settings import AppSettings, ProviderConfig
+
+
+class FakeAIClient(AIClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, str]] = []
+
+    def is_available(self, settings: AppSettings) -> bool:
+        return settings.ai_mode != "skip"
+
+    def generate_text(self, settings: AppSettings, system_prompt: str, user_prompt: str) -> str:
+        self.calls.append((system_prompt, user_prompt))
+        if not self.is_available(settings):
+            raise Exception("AI is not configured")
+        return "Generated draft or summary"
+
+
+class FakeIMAP:
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.login_args: tuple[str, str] | None = None
+        self.search_args: tuple[str, ...] | None = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.logout()
+
+    def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
+        self.login_args = (username, password)
+        if password == "bad-app-password":
+            raise AssertionError("Should not be used in the success path")
+        return "OK", [b"logged in"]
+
+    def select(self, mailbox: str, readonly: bool = True) -> tuple[str, list[bytes]]:
+        return "OK", [b"1"]
+
+    def uid(self, command: str, *args: str):
+        if command == "SEARCH":
+            self.search_args = args
+            return "OK", [b"100 200"]
+        if command == "FETCH":
+            uid = args[0]
+            if uid == "200":
+                return "OK", [
+                    (b'200 (FLAGS ())', self._build_message_bytes(subject="Project update", sender="Alice <alice@example.com>", body="Please review the attached plan.")),
+                    b')',
+                ]
+            return "OK", [
+                (b'100 (FLAGS (\\Seen))', self._build_message_bytes(subject="Old note", sender="Bob <bob@example.com>", body="Already read.")),
+                b')',
+            ]
+        raise AssertionError(f"Unexpected IMAP command: {command}")
+
+    def logout(self) -> tuple[str, list[bytes]]:
+        return "BYE", [b"logout"]
+
+    def _build_message_bytes(self, subject: str, sender: str, body: str) -> bytes:
+        message = EmailMessage()
+        message["From"] = sender
+        message["To"] = "user@yahoo.com"
+        message["Subject"] = subject
+        message["Date"] = "Tue, 18 Mar 2025 10:00:00 +0000"
+        message.set_content(body)
+        return message.as_bytes()
+
+
+class FakeSMTP:
+    sent_messages: list[EmailMessage] = []
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.login_args: tuple[str, str] | None = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.quit()
+
+    def login(self, username: str, password: str) -> tuple[int, bytes]:
+        self.login_args = (username, password)
+        return 235, b"ok"
+
+    def send_message(self, message: EmailMessage) -> None:
+        self.__class__.sent_messages.append(message)
+
+    def quit(self) -> tuple[int, bytes]:
+        return 221, b"bye"
+
+
+class FailingIMAP(FakeIMAP):
+    def login(self, username: str, password: str):
+        raise YahooMailError(
+            "Yahoo rejected the login. Use a Yahoo app password, not your regular Yahoo password."
+        )
+
+
+class YahooMailServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        initialize_database(self.connection)
+        self.settings_store = SettingsStore(self.connection)
+        self.settings_store.save(
+            AppSettings(
+                ai_mode="local",
+                provider=ProviderConfig(provider_type="ollama", label="Ollama", base_url="http://localhost", model_name="tiny"),
+                yahoo_email="user@yahoo.com",
+                yahoo_app_password="app-password",
+                setup_complete=True,
+            )
+        )
+        self.logger = ActionLogger(self.connection)
+        self.ai_client = FakeAIClient()
+        FakeSMTP.sent_messages = []
+        self.service = YahooMailService(
+            settings_store=self.settings_store,
+            action_logger=self.logger,
+            ai_client=self.ai_client,
+            imap_factory=FakeIMAP,
+            smtp_factory=FakeSMTP,
+        )
+
+    def tearDown(self) -> None:
+        self.connection.close()
+
+    def test_connection_and_inbox_listing_work(self) -> None:
+        result = self.service.test_connection()
+        self.assertTrue(result.ok)
+        self.assertIn("IMAP login worked", result.message)
+
+        messages = self.service.list_inbox(
+            unread_only=True,
+            sender="alice@example.com",
+            subject_keyword="project",
+        )
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0].uid, "200")
+        self.assertTrue(messages[0].unread)
+        self.assertEqual(messages[0].subject, "Project update")
+
+    def test_read_summarize_and_draft_email(self) -> None:
+        message = self.service.read_email("200")
+        self.assertIn("Please review", message.body_text)
+        self.assertEqual(message.sender, "Alice <alice@example.com>")
+
+        summary = self.service.summarize_email("200")
+        self.assertEqual(summary, "Generated draft or summary")
+
+        reply_draft = self.service.draft_reply("200", "Say I will answer tomorrow.")
+        self.assertEqual(reply_draft.to_address, "alice@example.com")
+        self.assertTrue(reply_draft.subject.startswith("Re:"))
+
+        new_draft = self.service.draft_new_email("team@example.com", "Hello", "Share the update")
+        self.assertEqual(new_draft.body, "Generated draft or summary")
+        self.assertEqual(len(self.ai_client.calls), 3)
+
+    def test_send_email_uses_smtp(self) -> None:
+        self.service.send_email(
+            OutgoingDraft(
+                to_address="friend@example.com",
+                subject="Checking in",
+                body="Hello there",
+            )
+        )
+
+        self.assertEqual(len(FakeSMTP.sent_messages), 1)
+        sent = FakeSMTP.sent_messages[0]
+        self.assertEqual(sent["To"], "friend@example.com")
+        self.assertEqual(sent["Subject"], "Checking in")
+
+    def test_missing_app_password_is_reported_clearly(self) -> None:
+        self.service = YahooMailService(
+            settings_store=self.settings_store,
+            action_logger=self.logger,
+            ai_client=self.ai_client,
+            imap_factory=FailingIMAP,
+            smtp_factory=FakeSMTP,
+        )
+
+        with self.assertRaises(YahooMailError) as context:
+            self.service.test_connection()
+
+        self.assertIn("app password", str(context.exception).lower())
+
+
+if __name__ == "__main__":
+    unittest.main()

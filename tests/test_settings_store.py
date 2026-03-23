@@ -25,6 +25,8 @@ class SettingsStoreTests(unittest.TestCase):
         settings = self.store.load()
         self.assertEqual(settings.ai_mode, "skip")
         self.assertEqual(settings.provider.provider_type, "none")
+        self.assertEqual(settings.yahoo_imap_server, "imap.mail.yahoo.com")
+        self.assertEqual(settings.yahoo_smtp_port, 465)
 
     def test_save_and_load_round_trip(self) -> None:
         expected = AppSettings(
@@ -39,6 +41,10 @@ class SettingsStoreTests(unittest.TestCase):
             ),
             yahoo_email="user@yahoo.com",
             yahoo_app_password="secret",
+            yahoo_imap_server="imap.mail.yahoo.com",
+            yahoo_imap_port=993,
+            yahoo_smtp_server="smtp.mail.yahoo.com",
+            yahoo_smtp_port=465,
             setup_complete=True,
         )
         self.store.save(expected)
@@ -49,6 +55,8 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(actual.provider.provider_type, expected.provider.provider_type)
         self.assertEqual(actual.provider.model_name, expected.provider.model_name)
         self.assertEqual(actual.yahoo_email, expected.yahoo_email)
+        self.assertEqual(actual.yahoo_imap_port, expected.yahoo_imap_port)
+        self.assertEqual(actual.yahoo_smtp_server, expected.yahoo_smtp_server)
         self.assertTrue(actual.setup_complete)
 
 

@@ -35,6 +35,10 @@ class AppSettings:
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     yahoo_email: str = ""
     yahoo_app_password: str = ""
+    yahoo_imap_server: str = "imap.mail.yahoo.com"
+    yahoo_imap_port: int = 993
+    yahoo_smtp_server: str = "smtp.mail.yahoo.com"
+    yahoo_smtp_port: int = 465
     setup_complete: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -50,5 +54,12 @@ class AppSettings:
             provider=ProviderConfig.from_dict(payload.get("provider")),
             yahoo_email=payload.get("yahoo_email", ""),
             yahoo_app_password=payload.get("yahoo_app_password", ""),
+            yahoo_imap_server=payload.get("yahoo_imap_server", "imap.mail.yahoo.com"),
+            yahoo_imap_port=int(payload.get("yahoo_imap_port", 993) or 993),
+            yahoo_smtp_server=payload.get("yahoo_smtp_server", "smtp.mail.yahoo.com"),
+            yahoo_smtp_port=int(payload.get("yahoo_smtp_port", 465) or 465),
             setup_complete=bool(payload.get("setup_complete", False)),
         )
+
+    def yahoo_is_configured(self) -> bool:
+        return bool(self.yahoo_email.strip() and self.yahoo_app_password)

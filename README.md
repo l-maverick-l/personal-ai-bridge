@@ -2,15 +2,23 @@
 
 Personal AI Bridge is a Windows-first desktop helper for Yahoo Mail, approved local folders, and pluggable AI providers.
 
-## Phase 1 status
+## Current status
 
-This repository currently includes the Phase 1 desktop shell and scaffolding:
-- PySide6 desktop window
-- first-run setup wizard scaffold
-- SQLite-backed settings persistence
-- local logging to file and SQLite
-- allowed-folder registry with path validation helpers
-- AI provider selection scaffolding for Ollama and OpenAI-compatible endpoints
+This repository now includes:
+- PySide6 desktop UI with a first-run setup wizard
+- SQLite-backed settings persistence and local action logging
+- approved-folder registry with safe file browsing, reading, creation, rename, copy, move, and delete flows
+- Yahoo Mail Phase 3 support for:
+  - Yahoo settings in the UI
+  - Yahoo IMAP/SMTP connection testing with app passwords
+  - inbox listing and search by unread status, sender, subject keyword, and date range
+  - reading email content
+  - AI summaries for one email
+  - AI-generated draft replies and new emails
+  - SMTP send behind explicit confirmation only
+- AI provider configuration for Ollama and OpenAI-compatible local or cloud endpoints
+
+Mail listing, search, and reading still work when AI is not configured. AI is only required for summaries and draft generation.
 
 ## Run locally
 
