@@ -7,6 +7,7 @@ from app.core.app_context import AppContext
 from app.data.action_log import ActionLogger, configure_logging
 from app.data.database import connect_database
 from app.data.settings_store import SettingsStore
+from app.email.yahoo_service import YahooMailService
 from app.files.folder_registry import AllowedFolderRegistry
 from app.files.service import FileService
 
@@ -16,6 +17,12 @@ def build_context() -> tuple[AppContext, object]:
     settings_store = SettingsStore(connection)
     action_logger = ActionLogger(connection)
     folder_registry = AllowedFolderRegistry(connection)
+    ai_client = AIClient()
+    yahoo_mail_service = YahooMailService(
+        settings_store=settings_store,
+        action_logger=action_logger,
+        ai_client=ai_client,
+    )
     context = AppContext(
         settings_store=settings_store,
         action_logger=action_logger,
@@ -24,8 +31,10 @@ def build_context() -> tuple[AppContext, object]:
             folder_registry=folder_registry,
             action_logger=action_logger,
             settings_store=settings_store,
-            ai_client=AIClient(),
+            ai_client=ai_client,
         ),
+        ai_client=ai_client,
+        yahoo_mail_service=yahoo_mail_service,
     )
     return context, connection
 

@@ -30,24 +30,32 @@ class AIClient:
         )
 
     def summarize_text(self, text: str, settings: AppSettings) -> str:
-        if not self.is_available(settings):
-            raise AIUnavailableError(
-                "AI summarization is not available because no provider and model are configured."
-            )
-        provider = settings.provider
         prompt = (
             "Summarize the following file for a non-technical user. "
             "Use short bullets and keep important names, dates, and action items.\n\n"
             f"File content:\n{text[:12000]}"
         )
+        return self.generate_text(
+            settings,
+            system_prompt="You summarize user files clearly and briefly.",
+            user_prompt=prompt,
+        )
+
+    def generate_text(self, settings: AppSettings, system_prompt: str, user_prompt: str) -> str:
+        if not self.is_available(settings):
+            raise AIUnavailableError(
+                "AI features are not available because no provider and model are configured."
+            )
+        provider = settings.provider
         if provider.provider_type == "ollama":
-            return self._call_ollama(provider.base_url, provider.model_name, prompt)
+            return self._call_ollama(provider.base_url, provider.model_name, user_prompt)
         if provider.provider_type in {"openai_local", "openai_cloud"}:
             return self._call_openai_compatible(
                 provider.base_url,
                 provider.model_name,
                 provider.api_key,
-                prompt,
+                system_prompt,
+                user_prompt,
             )
         raise AIUnavailableError(f"Unsupported AI provider type: {provider.provider_type}")
 
@@ -60,7 +68,7 @@ class AIClient:
         response = self._post_json(f"{base_url.rstrip('/')}/api/generate", payload)
         summary = response.get("response", "").strip()
         if not summary:
-            raise AIClientError("The AI provider returned an empty summary.")
+            raise AIClientError("The AI provider returned an empty response.")
         return summary
 
     def _call_openai_compatible(
@@ -68,16 +76,14 @@ class AIClient:
         base_url: str,
         model_name: str,
         api_key: str,
-        prompt: str,
+        system_prompt: str,
+        user_prompt: str,
     ) -> str:
         payload = {
             "model": model_name,
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You summarize user files clearly and briefly.",
-                },
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.2,
         }
@@ -95,7 +101,7 @@ class AIClient:
         message = choices[0].get("message") or {}
         summary = str(message.get("content", "")).strip()
         if not summary:
-            raise AIClientError("The AI provider returned an empty summary.")
+            raise AIClientError("The AI provider returned an empty response.")
         return summary
 
     def _post_json(

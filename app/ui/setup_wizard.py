@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -13,14 +14,15 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
-    QFileDialog,
     QWizard,
     QWizardPage,
 )
 
 from app.ai.providers import PROVIDER_OPTIONS, get_provider_option
+from app.email.yahoo_service import YahooMailError, YahooMailService
 from app.models.settings import AppSettings, ProviderConfig
 
 
@@ -28,9 +30,13 @@ class WelcomePage(QWizardPage):
     def __init__(self) -> None:
         super().__init__()
         self.setTitle("Welcome")
-        self.setSubTitle("Personal AI Bridge will help you set up folders, mail, and optional AI.")
+        self.setSubTitle("Personal AI Bridge will help you set up folders, Yahoo Mail, and optional AI.")
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("This Phase 1 wizard saves your basic preferences and scaffolding only."))
+        layout.addWidget(
+            QLabel(
+                "Use a Yahoo app password for mail access. Regular Yahoo account passwords will not work here."
+            )
+        )
         self.setLayout(layout)
 
 
@@ -116,16 +122,33 @@ class ProviderPage(QWizardPage):
 
 
 class YahooPage(QWizardPage):
-    def __init__(self, email: str, app_password: str) -> None:
+    def __init__(self, settings: AppSettings) -> None:
         super().__init__()
         self.setTitle("Yahoo Mail")
-        self.setSubTitle("Enter your Yahoo email address and app password. This is stored as Phase 1 scaffolding.")
+        self.setSubTitle("Enter your Yahoo email address and Yahoo app password.")
         layout = QFormLayout()
-        self.email_edit = QLineEdit(email)
-        self.password_edit = QLineEdit(app_password)
+        self.email_edit = QLineEdit(settings.yahoo_email)
+        self.password_edit = QLineEdit(settings.yahoo_app_password)
         self.password_edit.setEchoMode(QLineEdit.Password)
+        self.imap_server_edit = QLineEdit(settings.yahoo_imap_server)
+        self.imap_port_edit = QSpinBox()
+        self.imap_port_edit.setRange(1, 65535)
+        self.imap_port_edit.setValue(settings.yahoo_imap_port)
+        self.smtp_server_edit = QLineEdit(settings.yahoo_smtp_server)
+        self.smtp_port_edit = QSpinBox()
+        self.smtp_port_edit.setRange(1, 65535)
+        self.smtp_port_edit.setValue(settings.yahoo_smtp_port)
+        help_label = QLabel(
+            "Yahoo expects an app password here. Generate it in your Yahoo account security settings."
+        )
+        help_label.setWordWrap(True)
         layout.addRow("Yahoo email", self.email_edit)
         layout.addRow("App password", self.password_edit)
+        layout.addRow("IMAP server", self.imap_server_edit)
+        layout.addRow("IMAP port", self.imap_port_edit)
+        layout.addRow("SMTP server", self.smtp_server_edit)
+        layout.addRow("SMTP port", self.smtp_port_edit)
+        layout.addRow("", help_label)
         self.setLayout(layout)
 
 
@@ -169,15 +192,32 @@ class FoldersPage(QWizardPage):
 
 
 class TestConnectionsPage(QWizardPage):
-    def __init__(self) -> None:
+    def __init__(self, settings_builder, yahoo_mail_service: YahooMailService) -> None:
         super().__init__()
+        self._settings_builder = settings_builder
+        self._yahoo_mail_service = yahoo_mail_service
         self.setTitle("Test connections")
-        self.setSubTitle("Phase 1 uses placeholder checks so users can review what will be wired up later.")
+        self.setSubTitle("Test Yahoo Mail now. You can skip AI for now and still use mail listing and reading.")
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("Yahoo Mail: placeholder test only"))
-        layout.addWidget(QLabel("AI provider: placeholder test only"))
-        layout.addWidget(QLabel("Approved folders: chosen folders will be saved when you finish"))
+        self.status_label = QLabel(
+            "Yahoo Mail test has not been run yet. Use the Yahoo app password above, then click Test Yahoo connection."
+        )
+        self.status_label.setWordWrap(True)
+        test_button = QPushButton("Test Yahoo connection")
+        test_button.clicked.connect(self._test_yahoo)
+        layout.addWidget(self.status_label)
+        layout.addWidget(test_button)
+        layout.addWidget(QLabel("AI provider testing is optional in this phase."))
         self.setLayout(layout)
+
+    def _test_yahoo(self) -> None:
+        try:
+            result = self._yahoo_mail_service.test_connection(self._settings_builder())
+            self.status_label.setText(result.message)
+            QMessageBox.information(self, "Yahoo connection works", result.message)
+        except YahooMailError as exc:
+            self.status_label.setText(str(exc))
+            QMessageBox.warning(self, "Yahoo connection failed", str(exc))
 
 
 class FinishPage(QWizardPage):
@@ -191,19 +231,25 @@ class FinishPage(QWizardPage):
 
 
 class SetupWizard(QWizard):
-    def __init__(self, settings: AppSettings, allowed_folders: list[str], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        allowed_folders: list[str],
+        yahoo_mail_service: YahooMailService,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Personal AI Bridge Setup")
         self.setWizardStyle(QWizard.ModernStyle)
-        self.resize(700, 520)
+        self.resize(760, 560)
 
         initial_mode = settings.ai_mode if settings.ai_mode in {"local", "cloud", "skip"} else "skip"
         self.welcome_page = WelcomePage()
         self.ai_mode_page = AiModePage(initial_mode)
         self.provider_page = ProviderPage(settings.provider)
-        self.yahoo_page = YahooPage(settings.yahoo_email, settings.yahoo_app_password)
+        self.yahoo_page = YahooPage(settings)
         self.folders_page = FoldersPage(allowed_folders)
-        self.test_page = TestConnectionsPage()
+        self.test_page = TestConnectionsPage(self.build_settings, yahoo_mail_service)
         self.finish_page = FinishPage()
 
         self.addPage(self.welcome_page)
@@ -224,6 +270,10 @@ class SetupWizard(QWizard):
             provider=provider,
             yahoo_email=self.yahoo_page.email_edit.text().strip(),
             yahoo_app_password=self.yahoo_page.password_edit.text(),
+            yahoo_imap_server=self.yahoo_page.imap_server_edit.text().strip(),
+            yahoo_imap_port=self.yahoo_page.imap_port_edit.value(),
+            yahoo_smtp_server=self.yahoo_page.smtp_server_edit.text().strip(),
+            yahoo_smtp_port=self.yahoo_page.smtp_port_edit.value(),
             setup_complete=True,
         )
 

@@ -1,1 +1,1 @@
-"""Yahoo mail integration scaffolding."""
+"""Yahoo Mail integration services."""
