@@ -22,6 +22,14 @@ class AITimeoutError(AIClientError):
     """Raised when the provider did not respond in time."""
 
 
+class AIModelOutputError(AIClientError):
+    """Raised when the provider response is syntactically present but unusable."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 @dataclass(slots=True)
 class AIProviderTestResult:
     provider: str
@@ -87,6 +95,7 @@ class AIClient:
             return self._call_ollama(
                 provider.base_url,
                 provider.model_name,
+                system_prompt,
                 user_prompt,
                 request_timeout,
                 on_status=on_status,
@@ -136,43 +145,95 @@ class AIClient:
         self,
         base_url: str,
         model_name: str,
-        prompt: str,
+        system_prompt: str,
+        user_prompt: str,
         request_timeout: int,
         on_status: Callable[[str], None] | None = None,
         on_partial: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        json_mode: bool = False,
     ) -> str:
         payload = {
             "model": model_name,
-            "prompt": prompt,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             "stream": True,
+            "options": {"temperature": 0.2},
         }
+        if json_mode:
+            payload["format"] = "json"
+            payload["options"] = {"temperature": 0}
         if on_status:
             on_status("Connecting to AI provider")
         response_chunks = self._stream_json_lines(
-            f"{base_url.rstrip('/')}/api/generate",
+            f"{base_url.rstrip('/')}/api/chat",
             payload,
             timeout_seconds=request_timeout,
             on_status=on_status,
             is_cancelled=is_cancelled,
         )
         chunks: list[str] = []
-        saw_activity = False
+        saw_chunks = False
+        saw_text_chunk = False
         for item in response_chunks:
-            saw_activity = True
-            piece = str(item.get("response", ""))
+            saw_chunks = True
+            message = item.get("message")
+            piece = ""
+            if isinstance(message, dict):
+                piece = str(message.get("content", ""))
             if piece:
+                saw_text_chunk = True
                 chunks.append(piece)
                 if on_partial:
                     on_partial("".join(chunks))
         summary = "".join(chunks).strip()
         if not summary:
-            if saw_activity:
-                raise AIClientError(
-                    "The local model was active but did not return usable text. Try a different model."
+            if saw_chunks and saw_text_chunk:
+                raise AIModelOutputError(
+                    reason="whitespace_only",
+                    message="The local model returned whitespace-only output.",
                 )
-            raise AIClientError("The AI provider returned an empty response.")
+            if saw_chunks:
+                raise AIModelOutputError(
+                    reason="no_text_tokens",
+                    message="The local model produced response events but no text tokens.",
+                )
+            raise AIModelOutputError(
+                reason="no_tokens",
+                message="The local model returned no generation output.",
+            )
         return summary
+
+    def generate_structured_json(
+        self,
+        settings: AppSettings,
+        system_prompt: str,
+        user_prompt: str,
+        on_status: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> str:
+        provider = settings.provider
+        request_timeout = self._timeout_for_settings(settings)
+        if provider.provider_type == "ollama":
+            return self._call_ollama(
+                provider.base_url,
+                provider.model_name,
+                system_prompt,
+                user_prompt,
+                request_timeout,
+                on_status=on_status,
+                is_cancelled=is_cancelled,
+                json_mode=True,
+            )
+        return self.generate_text(
+            settings=settings,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            on_status=on_status,
+            is_cancelled=is_cancelled,
+        )
 
     def _call_openai_compatible(
         self,

@@ -7,7 +7,7 @@ from enum import Enum
 from collections.abc import Callable
 from typing import Any
 
-from app.ai.client import AIClient, AIClientError, AIUnavailableError
+from app.ai.client import AIClient, AIClientError, AIModelOutputError, AIUnavailableError
 from app.email.yahoo_service import OutgoingDraft, YahooMailError, YahooMailService
 from app.files.service import FileOperationError, FileService
 from app.models.settings import AppSettings
@@ -67,6 +67,13 @@ class AssistantService:
         "draft_reply",
         "draft_new_email",
         "send_email",
+    )
+    _REQUIRED_PLAN_FIELDS: tuple[str, ...] = (
+        "intent",
+        "tool_calls",
+        "final_answer",
+        "proposed_actions",
+        "needs_confirmation",
     )
 
     def __init__(self, file_service: FileService, yahoo_service: YahooMailService, ai_client: AIClient) -> None:
@@ -188,17 +195,21 @@ class AssistantService:
         )
 
         try:
-            raw = self._ai_client.generate_text(settings=settings, system_prompt=system_prompt, user_prompt=user_prompt)
+            raw = self._ai_client.generate_structured_json(
+                settings=settings,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
         except (AIUnavailableError, AIClientError) as exc:
             return {
                 "intent": "error",
                 "tool_calls": [],
-                "final_answer": f"AI is unavailable right now: {exc}",
+                "final_answer": self._planner_error_from_exception(exc),
                 "proposed_actions": [],
                 "needs_confirmation": False,
             }
 
-        parsed = self._parse_structured_output(raw)
+        parsed, parse_error = self._parse_structured_output(raw)
         if parsed:
             return parsed
 
@@ -209,7 +220,7 @@ class AssistantService:
             f"Invalid response:\n{raw}"
         )
         try:
-            repaired = self._ai_client.generate_text(
+            repaired = self._ai_client.generate_structured_json(
                 settings=settings,
                 system_prompt="Return strict JSON only.",
                 user_prompt=repair_prompt,
@@ -219,43 +230,50 @@ class AssistantService:
                 "intent": "error",
                 "tool_calls": [],
                 "final_answer": (
-                    "I could not parse the local model response and repair also failed: "
-                    f"{exc}. Please try again with a shorter request."
+                    f"{self._planner_error_from_parse(parse_error)} "
+                    f"Repair attempt also failed: {self._planner_error_from_exception(exc)}"
                 ),
                 "proposed_actions": [],
                 "needs_confirmation": False,
             }
 
-        repaired_parsed = self._parse_structured_output(repaired)
+        repaired_parsed, repaired_error = self._parse_structured_output(repaired)
         if repaired_parsed:
             return repaired_parsed
         return {
             "intent": "error",
             "tool_calls": [],
-            "final_answer": (
-                "I could not parse the model response into the required assistant format. "
-                "Try a shorter request or a different model."
-            ),
+            "final_answer": f"{self._planner_error_from_parse(repaired_error)} Try a stronger local model for agent planning.",
             "proposed_actions": [],
             "needs_confirmation": False,
         }
 
-    def _parse_structured_output(self, raw_text: str) -> dict[str, Any] | None:
+    def _parse_structured_output(self, raw_text: str) -> tuple[dict[str, Any] | None, str]:
         text = raw_text.strip()
+        if not text:
+            return None, "empty_output"
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+        if not text:
+            return None, "whitespace_output"
         try:
             candidate = json.loads(text)
         except json.JSONDecodeError:
             candidate = self._try_parse_first_json_object(text)
+        if candidate is None:
+            return None, "malformed_json"
         if not isinstance(candidate, dict):
-            return None
+            return None, "malformed_json"
+
+        missing_fields = [field for field in self._REQUIRED_PLAN_FIELDS if field not in candidate]
+        if missing_fields:
+            return None, f"missing_fields:{','.join(missing_fields)}"
 
         tool_calls = candidate.get("tool_calls", [])
         if tool_calls is None:
             tool_calls = []
         if not isinstance(tool_calls, list):
-            return None
+            return None, "invalid_tool_calls"
 
         normalized = {
             "intent": str(candidate.get("intent", "general")),
@@ -264,7 +282,31 @@ class AssistantService:
             "proposed_actions": candidate.get("proposed_actions", []),
             "needs_confirmation": bool(candidate.get("needs_confirmation", False)),
         }
-        return normalized
+        return normalized, ""
+
+    def _planner_error_from_exception(self, exc: Exception) -> str:
+        if isinstance(exc, AIModelOutputError):
+            if exc.reason == "no_tokens":
+                return "The local model returned no tokens for planning output."
+            if exc.reason == "no_text_tokens":
+                return "The local model streamed events but never produced text tokens."
+            if exc.reason == "whitespace_only":
+                return "The local model returned whitespace-only output."
+        return f"AI planning failed: {exc}"
+
+    def _planner_error_from_parse(self, parse_error: str) -> str:
+        if parse_error == "empty_output":
+            return "The planner output was empty."
+        if parse_error == "whitespace_output":
+            return "The planner output was whitespace only."
+        if parse_error == "malformed_json":
+            return "The model could not follow the required JSON format."
+        if parse_error.startswith("missing_fields:"):
+            missing = parse_error.split(":", 1)[1]
+            return f"The model returned JSON but missed required planner fields: {missing}."
+        if parse_error == "invalid_tool_calls":
+            return "The model returned JSON but tool_calls was not a list."
+        return "The model output could not be parsed into the planner schema."
 
     def _try_parse_first_json_object(self, text: str) -> dict[str, Any] | None:
         start = text.find("{")

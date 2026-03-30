@@ -25,6 +25,9 @@ class FakeAIClient:
             raise RuntimeError("No fake responses left")
         return self._responses.pop(0)
 
+    def generate_structured_json(self, settings, system_prompt: str, user_prompt: str, **kwargs) -> str:  # noqa: ANN001
+        return self.generate_text(settings, system_prompt, user_prompt, **kwargs)
+
 
 class AssistantServiceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -108,6 +111,22 @@ class AssistantServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(response.answer_text, "Done.")
+
+    def test_missing_required_fields_returns_clear_error(self) -> None:
+        assistant = self._assistant_with_ai(
+            [
+                '{"intent":"general","tool_calls":[],"final_answer":"Done."}',
+                '{"intent":"general","tool_calls":[],"final_answer":"Done."}',
+            ]
+        )
+
+        response = assistant.handle_request(
+            "Just answer",
+            AssistantContext(selected_root=str(self.root)),
+            self.store.load(),
+        )
+
+        self.assertIn("missed required planner fields", response.answer_text)
 
     def test_root_folder_context_is_preserved(self) -> None:
         assistant = self._assistant_with_ai(
