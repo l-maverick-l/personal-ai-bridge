@@ -286,10 +286,12 @@ class AssistantService:
 
     def _planner_error_from_exception(self, exc: Exception) -> str:
         if isinstance(exc, AIModelOutputError):
-            if exc.reason == "no_tokens":
-                return "The local model returned no tokens for planning output."
-            if exc.reason == "no_text_tokens":
-                return "The local model streamed events but never produced text tokens."
+            if exc.reason == "no_stream":
+                return "The local model returned no stream output for planning."
+            if exc.reason == "reasoning_only_stream":
+                return "The local model streamed reasoning/thinking output only and never emitted a final planner answer."
+            if exc.reason == "no_final_answer":
+                return "The local model streamed output but never emitted a usable final planner answer."
             if exc.reason == "whitespace_only":
                 return "The local model returned whitespace-only output."
         return f"AI planning failed: {exc}"
