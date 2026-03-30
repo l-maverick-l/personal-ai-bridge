@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QDate, Qt, QTimer
+from PySide6.QtCore import QDate, QPoint, Qt, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
+    QTreeWidget,
+    QTreeWidgetItem,
     QDateEdit,
     QFileDialog,
     QFormLayout,
@@ -22,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QMenu,
     QScrollArea,
     QSplitter,
     QTabWidget,
@@ -32,9 +40,17 @@ from PySide6.QtWidgets import (
 
 from app.core.app_context import AppContext
 from app.email.yahoo_service import MailMessageView, MailSummary, OutgoingDraft, YahooMailError
-from app.files.service import DirectoryListing, FileOperationError, FileReadResult
+from app.files.service import DirectoryListing, FileEntry, FileOperationError, FileReadResult
 from app.models.settings import AppSettings
 from app.ui.setup_wizard import SetupWizard
+
+
+@dataclass(slots=True)
+class SearchViewItemData:
+    approved_root: str
+    absolute_path: str
+    relative_path: str
+    is_dir: bool
 
 
 class MainWindow(QMainWindow):
@@ -47,6 +63,7 @@ class MainWindow(QMainWindow):
         self._mail_results: list[MailSummary] = []
         self._current_email: MailMessageView | None = None
         self._allow_remote_images_current_message = False
+        self._search_view_item_role = Qt.ItemDataRole.UserRole + 1
 
         self.setWindowTitle("Personal AI Bridge")
         self.resize(1500, 900)
@@ -378,12 +395,23 @@ class MainWindow(QMainWindow):
         self.file_preview = QPlainTextEdit()
         self.file_preview.setReadOnly(True)
         self.file_preview.setPlainText("Selected file contents will appear here.")
-        self.search_context = QPlainTextEdit()
-        self.search_context.setReadOnly(True)
-        self.search_context.setPlainText("Folder listings, file search results, and Yahoo inbox results will appear here.")
+        search_view_widget = QWidget()
+        search_view_layout = QVBoxLayout(search_view_widget)
+        self.search_context_label = QLabel("Folder listings and file search results appear below.")
+        self.search_context_label.setWordWrap(True)
+        self.search_context_tree = QTreeWidget()
+        self.search_context_tree.setHeaderLabels(["Type", "Relative path", "Size"])
+        self.search_context_tree.setRootIsDecorated(False)
+        self.search_context_tree.setAlternatingRowColors(True)
+        self.search_context_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.search_context_tree.itemClicked.connect(self._search_item_clicked)
+        self.search_context_tree.itemDoubleClicked.connect(self._search_item_double_clicked)
+        self.search_context_tree.customContextMenuRequested.connect(self._show_search_item_context_menu)
+        search_view_layout.addWidget(self.search_context_label)
+        search_view_layout.addWidget(self.search_context_tree)
         tabs.addTab(preview_widget, "Email preview")
         tabs.addTab(self.file_preview, "File preview")
-        tabs.addTab(self.search_context, "Folder/search view")
+        tabs.addTab(search_view_widget, "Folder/search view")
         return tabs
 
     def refresh_ui(self) -> None:
@@ -503,12 +531,23 @@ class MainWindow(QMainWindow):
         if not selected:
             self._show_result("Select a Yahoo message from the results list first.")
             return
+        self._load_mail_preview(selected, trigger="manual")
+
+    def _load_mail_preview(self, selected: MailSummary, trigger: str) -> None:
+        if self._current_email and self._current_email.uid == selected.uid:
+            self._show_email(self._current_email)
+            if trigger == "selection":
+                self._show_result(f"Previewing Yahoo email: {self._current_email.subject}")
+            else:
+                self._show_result(f"Yahoo email already loaded: {self._current_email.subject}")
+            return
         try:
             self._current_email = self._context.yahoo_mail_service.read_email(selected.uid)
             self._allow_remote_images_current_message = False
             self.load_remote_images_button.setEnabled(bool(self._current_email.body_html))
             self._show_email(self._current_email)
-            self._show_result(f"Read Yahoo email: {self._current_email.subject}")
+            action = "Previewing" if trigger == "selection" else "Read"
+            self._show_result(f"{action} Yahoo email: {self._current_email.subject}")
         except YahooMailError as exc:
             self._show_error("Could not read Yahoo email", exc)
 
@@ -597,17 +636,14 @@ class MainWindow(QMainWindow):
 
     def _populate_mail_results(self, results: list[MailSummary]) -> None:
         self.mail_results_list.clear()
-        lines = ["Yahoo inbox results:"]
         for message in results:
             unread_prefix = "[Unread] " if message.unread else "[Read] "
             label = f"{unread_prefix}{message.received_at} — {message.sender} — {message.subject}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, message.uid)
             self.mail_results_list.addItem(item)
-            lines.append(f"{message.uid}: {label}")
-        if len(lines) == 1:
-            lines.append("(no messages matched the current filter)")
-        self.search_context.setPlainText("\n".join(lines))
+        if not results:
+            self.email_preview.setHtml("<p>No Yahoo messages matched the current filters.</p>")
 
     def _selected_mail_summary(self) -> MailSummary | None:
         item = self.mail_results_list.currentItem()
@@ -620,11 +656,7 @@ class MainWindow(QMainWindow):
         selected = self._selected_mail_summary()
         if not selected:
             return
-        self.draft_to_input.setText(self.draft_to_input.text() or "")
-        self.results_output.setPlainText(
-            f"Selected Yahoo message from {selected.sender} with subject '{selected.subject}'."
-        )
-        self.refresh_ui()
+        self._load_mail_preview(selected, trigger="selection")
 
     def _show_email(self, message: MailMessageView) -> None:
         preview_html = self._context.yahoo_mail_service.build_safe_preview_html(
@@ -709,14 +741,7 @@ class MainWindow(QMainWindow):
             return
         try:
             matches = self._context.file_service.search_files(root, self.search_input.text())
-            if not matches:
-                self.search_context.setPlainText("No matching files or folders were found.")
-            else:
-                lines = [f"Search results in {root}:"]
-                for entry in matches:
-                    entry_type = "DIR " if entry.is_dir else "FILE"
-                    lines.append(f"[{entry_type}] {entry.relative_path}")
-                self.search_context.setPlainText("\n".join(lines))
+            self._show_file_search_results(root, matches)
             self._show_result(f"Found {len(matches)} matching item(s).")
         except FileOperationError as exc:
             self._show_error("Could not search files", exc)
@@ -962,14 +987,123 @@ class MainWindow(QMainWindow):
         self.list_selected_folder()
 
     def _show_directory_listing(self, listing: DirectoryListing) -> None:
-        lines = [f"Folder listing for {listing.root}:{listing.relative_path}"]
-        if not listing.entries:
-            lines.append("(empty folder)")
+        self.search_context_label.setText(f"Folder listing for {listing.root}:{listing.relative_path or '.'}")
+        self.search_context_tree.clear()
         for entry in listing.entries:
-            entry_type = "DIR " if entry.is_dir else "FILE"
-            size = "" if entry.is_dir else f" ({entry.size} bytes)"
-            lines.append(f"[{entry_type}] {entry.relative_path}{size}")
-        self.search_context.setPlainText("\n".join(lines))
+            self._append_search_item(
+                approved_root=listing.root,
+                absolute_path=entry.path,
+                relative_path=entry.relative_path,
+                is_dir=entry.is_dir,
+                size=entry.size,
+            )
+        if not listing.entries:
+            empty_item = QTreeWidgetItem(["—", "(empty folder)", ""])
+            empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.search_context_tree.addTopLevelItem(empty_item)
+
+    def _show_file_search_results(self, root: str, matches: list[FileEntry]) -> None:
+        self.search_context_label.setText(f"Search results in {root}")
+        self.search_context_tree.clear()
+        for entry in matches:
+            self._append_search_item(
+                approved_root=root,
+                absolute_path=entry.path,
+                relative_path=entry.relative_path,
+                is_dir=entry.is_dir,
+                size=entry.size,
+            )
+        if not matches:
+            empty_item = QTreeWidgetItem(["—", "(no matching files or folders)", ""])
+            empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.search_context_tree.addTopLevelItem(empty_item)
+
+    def _append_search_item(
+        self,
+        approved_root: str,
+        absolute_path: str,
+        relative_path: str,
+        is_dir: bool,
+        size: int,
+    ) -> None:
+        item_type = "Folder" if is_dir else "File"
+        size_text = "" if is_dir else f"{size} bytes"
+        item = QTreeWidgetItem([item_type, relative_path, size_text])
+        item_data = SearchViewItemData(
+            approved_root=approved_root,
+            absolute_path=absolute_path,
+            relative_path=relative_path,
+            is_dir=is_dir,
+        )
+        item.setData(0, self._search_view_item_role, item_data)
+        self.search_context_tree.addTopLevelItem(item)
+
+    def _search_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        item_data = self._search_item_data(item)
+        if not item_data:
+            return
+        self.path_input.setText(item_data.relative_path)
+        self._restore_combo_value(self.root_selector, item_data.approved_root)
+        if item_data.is_dir:
+            self.list_selected_folder()
+            return
+        try:
+            read_result = self._context.file_service.read_file(item_data.approved_root, item_data.relative_path)
+            self._show_file(read_result)
+            self._show_result(f"Selected file: {item_data.relative_path}")
+        except FileOperationError:
+            self._show_result(f"Selected file path: {item_data.relative_path}")
+
+    def _search_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        item_data = self._search_item_data(item)
+        if not item_data:
+            return
+        if item_data.is_dir:
+            self.path_input.setText(item_data.relative_path)
+            self.list_selected_folder()
+        else:
+            self.path_input.setText(item_data.relative_path)
+            self.read_selected_file()
+
+    def _show_search_item_context_menu(self, position: QPoint) -> None:
+        item = self.search_context_tree.itemAt(position)
+        item_data = self._search_item_data(item) if item else None
+        if not item_data:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("Open containing folder")
+        copy_relative_action = menu.addAction("Copy relative path")
+        copy_full_action = menu.addAction("Copy full path")
+        chosen = menu.exec(self.search_context_tree.viewport().mapToGlobal(position))
+        if chosen == open_action:
+            self._open_item_location(item_data)
+        elif chosen == copy_relative_action:
+            QApplication.clipboard().setText(item_data.relative_path)
+            self._show_result(f"Copied relative path: {item_data.relative_path}")
+        elif chosen == copy_full_action:
+            QApplication.clipboard().setText(item_data.absolute_path)
+            self._show_result(f"Copied full path: {item_data.absolute_path}")
+
+    def _search_item_data(self, item: QTreeWidgetItem | None) -> SearchViewItemData | None:
+        if not item:
+            return None
+        value = item.data(0, self._search_view_item_role)
+        if isinstance(value, SearchViewItemData):
+            return value
+        return None
+
+    def _open_item_location(self, item_data: SearchViewItemData) -> None:
+        target_path = Path(item_data.absolute_path) if item_data.is_dir else Path(item_data.absolute_path).parent
+        try:
+            if os.name == "nt":
+                os.startfile(str(target_path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target_path)])
+            else:
+                subprocess.Popen(["xdg-open", str(target_path)])
+            self._show_result(f"Opened location: {target_path}")
+        except Exception as exc:
+            self._show_error("Could not open path in file explorer", exc)
 
     def _show_file(self, read_result: FileReadResult) -> None:
         self.file_preview.setPlainText(read_result.content)
