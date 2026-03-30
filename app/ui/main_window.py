@@ -39,6 +39,12 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.app_context import AppContext
+from app.assistant.manager import (
+    AssistantActionProposal,
+    AssistantContext,
+    AssistantService,
+    proposal_to_json,
+)
 from app.email.yahoo_service import MailMessageView, MailSummary, OutgoingDraft, YahooMailError
 from app.files.service import DirectoryListing, FileEntry, FileOperationError, FileReadResult
 from app.models.settings import AppSettings
@@ -70,6 +76,12 @@ class MainWindow(QMainWindow):
         self._folder_view_history: list[str] = []
         self._ai_thread: QThread | None = None
         self._ai_worker: AIWorker | None = None
+        self._assistant_service = AssistantService(
+            self._context.file_service,
+            self._context.yahoo_mail_service,
+            self._context.ai_client,
+        )
+        self._assistant_proposals: list[AssistantActionProposal] = []
 
         self.setWindowTitle("Personal AI Bridge")
         self.resize(1500, 900)
@@ -154,6 +166,7 @@ class MainWindow(QMainWindow):
         self.center_tabs = QTabWidget()
         self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_files_tab()), "Files")
         self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_email_tab()), "Yahoo Mail")
+        self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_assistant_tab()), "Assistant")
 
         actions_confirm_group = QGroupBox("Pending confirmation")
         actions_confirm_layout = QVBoxLayout(actions_confirm_group)
@@ -380,6 +393,42 @@ class MainWindow(QMainWindow):
         layout.addWidget(search_group)
         layout.addWidget(draft_group)
         return widget
+
+    def _build_assistant_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        assistant_group = QGroupBox("Assistant conversation")
+        assistant_layout = QVBoxLayout(assistant_group)
+        self.assistant_status_label = QLabel("Assistant status: idle")
+        self.assistant_status_label.setWordWrap(True)
+        self.assistant_history = QTextBrowser()
+        self.assistant_history.setHtml("<p>Ask plain-English questions about files and Yahoo Mail here.</p>")
+        self.assistant_input = QPlainTextEdit()
+        self.assistant_input.setPlaceholderText("Type a request like: 'Summarize the selected file' or 'Draft a reply saying I will respond tomorrow'.")
+        self.assistant_input.setMaximumHeight(100)
+        assistant_buttons = QHBoxLayout()
+        send_button = QPushButton("Send to assistant")
+        send_button.clicked.connect(self.run_assistant_request)
+        apply_button = QPushButton("Queue selected proposed action")
+        apply_button.clicked.connect(self.queue_selected_assistant_action)
+        assistant_buttons.addWidget(send_button)
+        assistant_buttons.addWidget(apply_button)
+
+        assistant_layout.addWidget(self.assistant_status_label)
+        assistant_layout.addWidget(self.assistant_history)
+        assistant_layout.addWidget(self.assistant_input)
+        assistant_layout.addLayout(assistant_buttons)
+
+        proposals_group = QGroupBox("Proposed actions")
+        proposals_layout = QVBoxLayout(proposals_group)
+        self.assistant_action_list = QListWidget()
+        proposals_layout.addWidget(self.assistant_action_list)
+
+        layout.addWidget(assistant_group)
+        layout.addWidget(proposals_group)
+        return widget
+
 
 
     def _wrap_in_scroll_area(self, content: QWidget) -> QScrollArea:
@@ -1172,6 +1221,124 @@ class MainWindow(QMainWindow):
 
     def _show_file(self, read_result: FileReadResult) -> None:
         self.file_preview.setPlainText(read_result.content)
+
+    def run_assistant_request(self) -> None:
+        request_text = self.assistant_input.toPlainText().strip()
+        if not request_text:
+            self._show_result("Type an assistant request first.")
+            return
+        if self._ai_thread and self._ai_thread.isRunning():
+            self._show_result("Another AI task is running. Wait or cancel it before sending a new assistant request.")
+            return
+
+        self.assistant_status_label.setText("Assistant status: analyzing request")
+        self._append_assistant_entry("User", request_text)
+        self._start_ai_task(
+            task_name="Assistant request",
+            task=lambda on_status, on_partial, is_cancelled: self._assistant_service.handle_request(
+                request_text=request_text,
+                context=self._current_assistant_context(),
+                settings=self._settings,
+            ),
+            on_success=self._assistant_request_succeeded,
+        )
+
+    def _assistant_request_succeeded(self, response) -> None:
+        self.assistant_status_label.setText("Assistant status: ready")
+        used_context = f"Used context: {', '.join(response.used_context)}" if response.used_context else "Used context: none"
+        body = f"Intent route: {response.intent.value}\n\n{response.answer_text}\n\n{used_context}"
+        self._append_assistant_entry("Assistant", body)
+        self.assistant_input.clear()
+
+        self._assistant_proposals = response.proposed_actions
+        self.assistant_action_list.clear()
+        for proposal in response.proposed_actions:
+            label = f"{proposal.title} {'(confirmation required)' if proposal.requires_confirmation else '(ready)'}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, proposal)
+            self.assistant_action_list.addItem(item)
+
+    def _append_assistant_entry(self, role: str, body: str) -> None:
+        existing = self.assistant_history.toHtml()
+        escaped = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        html = existing + f"<hr><p><b>{role}</b></p><p>{escaped}</p>"
+        self.assistant_history.setHtml(html)
+
+    def _current_assistant_context(self) -> AssistantContext:
+        selected_mail = self._selected_mail_summary()
+        return AssistantContext(
+            selected_root=self.root_selector.currentText().strip(),
+            selected_file_path=self.path_input.text().strip(),
+            open_folder_path=self._folder_view_relative_path,
+            selected_email_uid=selected_mail.uid if selected_mail else (self._current_email.uid if self._current_email else ""),
+            selected_email_subject=selected_mail.subject if selected_mail else (self._current_email.subject if self._current_email else ""),
+        )
+
+    def queue_selected_assistant_action(self) -> None:
+        item = self.assistant_action_list.currentItem()
+        if not item:
+            self._show_result("Select a proposed assistant action first.")
+            return
+        proposal = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(proposal, AssistantActionProposal):
+            self._show_result("Could not read the selected assistant proposal.")
+            return
+        try:
+            self._queue_assistant_action(proposal)
+            self._append_assistant_entry("Assistant", f"Queued action:\n{proposal_to_json(proposal)}")
+        except Exception as exc:
+            self._show_error("Could not queue assistant action", exc)
+
+    def _queue_assistant_action(self, proposal: AssistantActionProposal) -> None:
+        if proposal.action_type == "email_use_draft":
+            draft = OutgoingDraft(
+                to_address=proposal.parameters.get("to", ""),
+                subject=proposal.parameters.get("subject", ""),
+                body=proposal.parameters.get("body", ""),
+            )
+            self._apply_draft(draft)
+            self._show_result("Assistant draft applied to the Yahoo draft editor. Review before sending.")
+            return
+
+        if proposal.action_type == "email_send":
+            self._set_pending_action(
+                message="Assistant requested sending the current draft email. Confirm to send via Yahoo SMTP.",
+                action=self._perform_send_email,
+            )
+            return
+
+        if proposal.action_type == "file_delete":
+            root = proposal.parameters.get("root", "")
+            relative_path = proposal.parameters.get("relative_path", "")
+            self._set_pending_action(
+                message=(
+                    "Assistant requested deleting a file. Confirm to move it to safe trash.\n\n"
+                    f"File: {root}:{relative_path}"
+                ),
+                action=lambda: self._perform_delete(root, relative_path),
+            )
+            return
+
+        if proposal.action_type == "file_move":
+            src_root = proposal.parameters.get("source_root", "")
+            src_rel = proposal.parameters.get("source_relative_path", "")
+            dst_root = proposal.parameters.get("destination_root", "")
+            dst_rel = proposal.parameters.get("destination_relative_path", "")
+            self._set_pending_action(
+                message=(
+                    "Assistant requested moving a file. Confirm before move.\n\n"
+                    f"Source: {src_root}:{src_rel}\n"
+                    f"Destination: {dst_root}:{dst_rel}"
+                ),
+                action=lambda: self._execute_assistant_move(src_root, src_rel, dst_root, dst_rel),
+            )
+            return
+
+        raise RuntimeError(f"Unsupported assistant proposal type: {proposal.action_type}")
+
+    def _execute_assistant_move(self, src_root: str, src_rel: str, dst_root: str, dst_rel: str) -> None:
+        destination = self._context.file_service.move_file(src_root, src_rel, dst_root, dst_rel)
+        self._show_result(f"Assistant move completed: {destination}")
 
     def test_ai_provider(self) -> None:
         result = self._context.ai_client.test_provider(self._settings)
