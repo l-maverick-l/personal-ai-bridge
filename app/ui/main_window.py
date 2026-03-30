@@ -164,9 +164,10 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
 
         self.center_tabs = QTabWidget()
+        self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_assistant_tab()), "Assistant")
         self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_files_tab()), "Files")
         self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_email_tab()), "Yahoo Mail")
-        self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_assistant_tab()), "Assistant")
+        self.center_tabs.setCurrentIndex(0)
 
         actions_confirm_group = QGroupBox("Pending confirmation")
         actions_confirm_layout = QVBoxLayout(actions_confirm_group)
@@ -403,9 +404,9 @@ class MainWindow(QMainWindow):
         self.assistant_status_label = QLabel("Assistant status: idle")
         self.assistant_status_label.setWordWrap(True)
         self.assistant_history = QTextBrowser()
-        self.assistant_history.setHtml("<p>Ask plain-English questions about files and Yahoo Mail here.</p>")
+        self.assistant_history.setHtml("<p><b>Primary workflow:</b> ask here in plain English and I will choose safe file/email tools for you.</p>")
         self.assistant_input = QPlainTextEdit()
-        self.assistant_input.setPlaceholderText("Type a request like: 'Summarize the selected file' or 'Draft a reply saying I will respond tomorrow'.")
+        self.assistant_input.setPlaceholderText("Example: 'Find files mentioning invoice', 'Summarize the selected email', or 'Move the selected file to Taxes/2026'.")
         self.assistant_input.setMaximumHeight(100)
         assistant_buttons = QHBoxLayout()
         send_button = QPushButton("Send to assistant")
@@ -1246,7 +1247,7 @@ class MainWindow(QMainWindow):
     def _assistant_request_succeeded(self, response) -> None:
         self.assistant_status_label.setText("Assistant status: ready")
         used_context = f"Used context: {', '.join(response.used_context)}" if response.used_context else "Used context: none"
-        body = f"Intent route: {response.intent.value}\n\n{response.answer_text}\n\n{used_context}"
+        body = f"{response.answer_text}\n\n{used_context}"
         self._append_assistant_entry("Assistant", body)
         self.assistant_input.clear()
 
@@ -1301,6 +1302,14 @@ class MainWindow(QMainWindow):
             return
 
         if proposal.action_type == "email_send":
+            if proposal.parameters.get("to") or proposal.parameters.get("subject") or proposal.parameters.get("body"):
+                self._apply_draft(
+                    OutgoingDraft(
+                        to_address=proposal.parameters.get("to", ""),
+                        subject=proposal.parameters.get("subject", ""),
+                        body=proposal.parameters.get("body", ""),
+                    )
+                )
             self._set_pending_action(
                 message="Assistant requested sending the current draft email. Confirm to send via Yahoo SMTP.",
                 action=self._perform_send_email,
@@ -1334,11 +1343,32 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if proposal.action_type == "file_copy":
+            src_root = proposal.parameters.get("source_root", "")
+            src_rel = proposal.parameters.get("source_relative_path", "")
+            dst_root = proposal.parameters.get("destination_root", "")
+            dst_rel = proposal.parameters.get("destination_relative_path", "")
+            overwrite = proposal.parameters.get("overwrite", "").lower() == "true"
+            self._set_pending_action(
+                message=(
+                    "Assistant requested copying a file. Confirm before copy.\n\n"
+                    f"Source: {src_root}:{src_rel}\n"
+                    f"Destination: {dst_root}:{dst_rel}\n"
+                    f"Overwrite: {'Yes' if overwrite else 'No'}"
+                ),
+                action=lambda: self._execute_assistant_copy(src_root, src_rel, dst_root, dst_rel, overwrite),
+            )
+            return
+
         raise RuntimeError(f"Unsupported assistant proposal type: {proposal.action_type}")
 
     def _execute_assistant_move(self, src_root: str, src_rel: str, dst_root: str, dst_rel: str) -> None:
         destination = self._context.file_service.move_file(src_root, src_rel, dst_root, dst_rel)
         self._show_result(f"Assistant move completed: {destination}")
+
+    def _execute_assistant_copy(self, src_root: str, src_rel: str, dst_root: str, dst_rel: str, overwrite: bool) -> None:
+        destination = self._context.file_service.copy_file(src_root, src_rel, dst_root, dst_rel, overwrite=overwrite)
+        self._show_result(f"Assistant copy completed: {destination}")
 
     def test_ai_provider(self) -> None:
         result = self._context.ai_client.test_provider(self._settings)

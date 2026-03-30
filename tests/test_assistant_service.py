@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.ai.client import AIClient
 from app.assistant.manager import AssistantContext, AssistantIntent, AssistantService
 from app.data.action_log import ActionLogger
 from app.data.database import initialize_database
@@ -14,6 +13,18 @@ from app.email.yahoo_service import YahooMailService
 from app.files.folder_registry import AllowedFolderRegistry
 from app.files.service import FileService
 from app.models.settings import AppSettings
+
+
+class FakeAIClient:
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = responses
+        self.calls: list[tuple[str, str]] = []
+
+    def generate_text(self, settings, system_prompt: str, user_prompt: str, **kwargs) -> str:  # noqa: ANN001
+        self.calls.append((system_prompt, user_prompt))
+        if not self._responses:
+            raise RuntimeError("No fake responses left")
+        return self._responses.pop(0)
 
 
 class AssistantServiceTests(unittest.TestCase):
@@ -25,38 +36,76 @@ class AssistantServiceTests(unittest.TestCase):
         self.logger = ActionLogger(self.connection)
         self.store = SettingsStore(self.connection)
         self.store.save(AppSettings())
-        self.ai_client = AIClient()
-        self.file_service = FileService(self.registry, self.logger, self.store, self.ai_client)
-        self.yahoo_service = YahooMailService(self.store, self.ai_client, self.logger)
-        self.assistant = AssistantService(self.file_service, self.yahoo_service, self.ai_client)
 
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name) / "approved"
         self.root.mkdir()
         self.registry.add_folder(str(self.root))
-        self.file_service.create_file(str(self.root), "docs/note.txt", "hello")
 
     def tearDown(self) -> None:
         self.connection.close()
         self.tempdir.cleanup()
 
-    def test_classify_intents(self) -> None:
-        self.assertEqual(self.assistant.classify_intent("What files mention invoice?"), AssistantIntent.FILE_READ_SEARCH)
-        self.assertEqual(self.assistant.classify_intent("Move this file to Taxes/2026"), AssistantIntent.FILE_ACTION)
-        self.assertEqual(self.assistant.classify_intent("Draft a reply saying thanks"), AssistantIntent.EMAIL_DRAFT_SEND)
+    def _assistant_with_ai(self, responses: list[str]) -> AssistantService:
+        ai_client = FakeAIClient(responses)
+        file_service = FileService(self.registry, self.logger, self.store, ai_client)
+        yahoo_service = YahooMailService(self.store, ai_client, self.logger)
+        return AssistantService(file_service, yahoo_service, ai_client)
 
-    def test_delete_action_is_proposal_only(self) -> None:
-        context = AssistantContext(selected_root=str(self.root), selected_file_path="docs/note.txt")
-        response = self.assistant.handle_request("Delete the selected file", context, self.store.load())
-        self.assertEqual(response.intent, AssistantIntent.FILE_ACTION)
+    def test_agent_uses_tool_then_returns_final_answer(self) -> None:
+        (self.root / "note.txt").write_text("hello", encoding="utf-8")
+        assistant = self._assistant_with_ai(
+            [
+                '{"intent":"file","tool_calls":[{"name":"search_files","arguments":{"query":"note"}}],"final_answer":"","proposed_actions":[],"needs_confirmation":false}',
+                '{"intent":"file","tool_calls":[],"final_answer":"I found note.txt.","proposed_actions":[],"needs_confirmation":false}',
+            ]
+        )
+
+        response = assistant.handle_request(
+            "Find files mentioning note",
+            AssistantContext(selected_root=str(self.root)),
+            self.store.load(),
+        )
+
+        self.assertEqual(response.intent, AssistantIntent.AGENT)
+        self.assertEqual(response.answer_text, "I found note.txt.")
+        self.assertEqual(response.proposed_actions, [])
+
+    def test_delete_request_produces_confirmation_proposal(self) -> None:
+        (self.root / "docs").mkdir(parents=True, exist_ok=True)
+        (self.root / "docs" / "note.txt").write_text("hello", encoding="utf-8")
+        assistant = self._assistant_with_ai(
+            [
+                '{"intent":"file","tool_calls":[{"name":"delete_file","arguments":{}}],"final_answer":"","proposed_actions":[],"needs_confirmation":true}',
+                '{"intent":"file","tool_calls":[],"final_answer":"I prepared a delete action for confirmation.","proposed_actions":[],"needs_confirmation":true}',
+            ]
+        )
+
+        response = assistant.handle_request(
+            "Delete the selected file",
+            AssistantContext(selected_root=str(self.root), selected_file_path="docs/note.txt"),
+            self.store.load(),
+        )
+
         self.assertEqual(len(response.proposed_actions), 1)
         self.assertEqual(response.proposed_actions[0].action_type, "file_delete")
-        self.assertTrue((self.root / "docs/note.txt").exists())
+        self.assertTrue((self.root / "docs" / "note.txt").exists())
 
-    def test_search_files_works_without_ai(self) -> None:
-        context = AssistantContext(selected_root=str(self.root))
-        response = self.assistant.handle_request("What files mention note", context, self.store.load())
-        self.assertIn("note.txt", response.answer_text)
+    def test_invalid_model_output_triggers_repair_attempt(self) -> None:
+        assistant = self._assistant_with_ai(
+            [
+                "not valid json",
+                '{"intent":"general","tool_calls":[],"final_answer":"Done.","proposed_actions":[],"needs_confirmation":false}',
+            ]
+        )
+
+        response = assistant.handle_request(
+            "Just answer",
+            AssistantContext(selected_root=str(self.root)),
+            self.store.load(),
+        )
+
+        self.assertEqual(response.answer_text, "Done.")
 
 
 if __name__ == "__main__":

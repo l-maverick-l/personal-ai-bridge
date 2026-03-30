@@ -4,20 +4,16 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from app.ai.client import AIClient, AIClientError, AIUnavailableError
-from app.email.yahoo_service import MailSummary, OutgoingDraft, YahooMailError, YahooMailService
+from app.email.yahoo_service import OutgoingDraft, YahooMailError, YahooMailService
 from app.files.service import FileOperationError, FileService
 from app.models.settings import AppSettings
 
 
 class AssistantIntent(str, Enum):
-    ASK_ONLY = "ask-only"
-    FILE_READ_SEARCH = "file read/search"
-    FILE_ACTION = "file action"
-    EMAIL_READ_SEARCH = "email read/search"
-    EMAIL_DRAFT_SEND = "email draft/send"
-    MIXED_REQUEST = "mixed request"
+    AGENT = "agent"
 
 
 @dataclass(slots=True)
@@ -45,319 +41,509 @@ class AssistantResponse:
     used_context: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class _AgentStep:
+    tool_name: str
+    args: dict[str, Any]
+    result: dict[str, Any]
+
+
 class AssistantService:
+    _MAX_AGENT_STEPS = 4
+    _SAFE_TOOLS: tuple[str, ...] = (
+        "list_directory",
+        "search_files",
+        "read_file",
+        "summarize_file",
+        "create_file",
+        "rename_file",
+        "copy_file",
+        "move_file",
+        "delete_file",
+        "list_inbox",
+        "read_email",
+        "summarize_email",
+        "draft_reply",
+        "draft_new_email",
+        "send_email",
+    )
+
     def __init__(self, file_service: FileService, yahoo_service: YahooMailService, ai_client: AIClient) -> None:
         self._file_service = file_service
         self._yahoo_service = yahoo_service
         self._ai_client = ai_client
 
-    def classify_intent(self, request_text: str) -> AssistantIntent:
-        lowered = request_text.lower()
-        has_file = any(word in lowered for word in ["file", "folder", "download", "path"])
-        has_email = any(word in lowered for word in ["email", "mail", "inbox", "reply", "draft"])
-        if has_file and has_email:
-            return AssistantIntent.MIXED_REQUEST
-        if any(word in lowered for word in ["move", "delete", "rename", "copy", "create"]):
-            return AssistantIntent.FILE_ACTION if has_file or "selected" in lowered else AssistantIntent.MIXED_REQUEST
-        if any(word in lowered for word in ["draft", "reply", "send"]) and has_email:
-            return AssistantIntent.EMAIL_DRAFT_SEND
-        if has_email:
-            return AssistantIntent.EMAIL_READ_SEARCH
-        if has_file or any(word in lowered for word in ["summarize", "summary", "find", "search", "read"]):
-            return AssistantIntent.FILE_READ_SEARCH
-        return AssistantIntent.ASK_ONLY
-
     def handle_request(self, request_text: str, context: AssistantContext, settings: AppSettings) -> AssistantResponse:
-        intent = self.classify_intent(request_text)
-        lowered = request_text.lower().strip()
-        if intent == AssistantIntent.FILE_ACTION:
-            return self._handle_file_action(request_text, lowered, context, intent)
-        if intent == AssistantIntent.EMAIL_DRAFT_SEND:
-            return self._handle_email_draft(request_text, lowered, context, settings, intent)
-        if intent == AssistantIntent.FILE_READ_SEARCH:
-            return self._handle_file_read_search(request_text, lowered, context, settings, intent)
-        if intent == AssistantIntent.EMAIL_READ_SEARCH:
-            return self._handle_email_read_search(request_text, lowered, context, settings, intent)
-        if intent == AssistantIntent.MIXED_REQUEST:
-            return AssistantResponse(
-                intent=intent,
-                answer_text=(
-                    "I detected both file and email tasks in one request. Please split it into two short requests "
-                    "(one for files, one for email) so I can execute safely."
-                ),
-            )
-        return self._handle_ask_only(request_text, context, settings, intent)
-
-    def _handle_ask_only(
-        self,
-        request_text: str,
-        context: AssistantContext,
-        settings: AppSettings,
-        intent: AssistantIntent,
-    ) -> AssistantResponse:
         used_context = self._context_labels(context)
-        prompt = (
-            "Answer the user in plain English in 3-6 short lines. "
-            "If context details are provided, mention how they affect your answer.\n\n"
-            f"Context: {', '.join(used_context) if used_context else 'none'}\n"
-            f"User request: {request_text}"
-        )
-        try:
-            answer = self._ai_client.generate_text(
-                settings=settings,
-                system_prompt="You are a safe desktop assistant for files and email.",
-                user_prompt=prompt,
-            )
-        except (AIUnavailableError, AIClientError):
-            answer = "AI is not configured right now. I can still run direct file and email operations from specific requests."
-        return AssistantResponse(intent=intent, answer_text=answer.strip(), used_context=used_context)
+        steps: list[_AgentStep] = []
+        proposals: list[AssistantActionProposal] = []
 
-    def _handle_file_read_search(
-        self,
-        request_text: str,
-        lowered: str,
-        context: AssistantContext,
-        settings: AppSettings,
-        intent: AssistantIntent,
-    ) -> AssistantResponse:
-        used_context = self._context_labels(context)
-        root = context.selected_root
-        if not root:
-            return AssistantResponse(intent=intent, answer_text="Select an approved root folder first.", used_context=used_context)
+        for index in range(self._MAX_AGENT_STEPS):
+            model_plan = self._plan_with_ai(request_text, context, settings, steps, index + 1)
+            tool_calls = model_plan.get("tool_calls") if isinstance(model_plan.get("tool_calls"), list) else []
+            final_answer = str(model_plan.get("final_answer", "")).strip()
 
-        if "summarize" in lowered and context.selected_file_path:
-            try:
-                summary = self._file_service.summarize_file(root, context.selected_file_path)
+            if tool_calls:
+                for call in tool_calls:
+                    execution = self._execute_tool_call(call, context)
+                    if execution.get("proposal"):
+                        proposals.append(execution["proposal"])
+                    serializable_result = dict(execution)
+                    if "proposal" in serializable_result:
+                        proposal = serializable_result.pop("proposal")
+                        if isinstance(proposal, AssistantActionProposal):
+                            serializable_result["proposal_meta"] = {
+                                "action_type": proposal.action_type,
+                                "title": proposal.title,
+                                "requires_confirmation": proposal.requires_confirmation,
+                            }
+                    steps.append(
+                        _AgentStep(
+                            tool_name=str(serializable_result.get("tool_name", "unknown")),
+                            args=serializable_result.get("args", {}),
+                            result=serializable_result,
+                        )
+                    )
+                continue
+
+            if final_answer:
                 return AssistantResponse(
-                    intent=intent,
-                    answer_text=f"Summary for {context.selected_file_path}:\n\n{summary}",
-                    used_context=used_context + ["selected file"],
-                )
-            except FileOperationError as exc:
-                return AssistantResponse(intent=intent, answer_text=str(exc), used_context=used_context)
-
-        if "read" in lowered and context.selected_file_path:
-            try:
-                read_result = self._file_service.read_file(root, context.selected_file_path)
-                preview = read_result.content[:3000]
-                suffix = "\n\n(Preview truncated.)" if len(read_result.content) > 3000 else ""
-                return AssistantResponse(
-                    intent=intent,
-                    answer_text=f"Read {context.selected_file_path}:\n\n{preview}{suffix}",
-                    used_context=used_context + ["selected file"],
-                )
-            except FileOperationError as exc:
-                return AssistantResponse(intent=intent, answer_text=str(exc), used_context=used_context)
-
-        query = self._extract_search_query(request_text)
-        if query:
-            try:
-                matches = self._file_service.search_files(root, query)
-                if not matches:
-                    return AssistantResponse(intent=intent, answer_text=f"I found no files matching '{query}'.", used_context=used_context)
-                top = "\n".join(f"- {item.relative_path}" for item in matches[:20])
-                return AssistantResponse(
-                    intent=intent,
-                    answer_text=f"I found {len(matches)} match(es) for '{query}':\n{top}",
+                    intent=AssistantIntent.AGENT,
+                    answer_text=final_answer,
+                    proposed_actions=proposals,
                     used_context=used_context,
                 )
-            except FileOperationError as exc:
-                return AssistantResponse(intent=intent, answer_text=str(exc), used_context=used_context)
 
-        if context.open_folder_path:
-            try:
-                listing = self._file_service.list_directory(root, context.open_folder_path)
-                top = "\n".join(f"- {entry.relative_path}" for entry in listing.entries[:20]) or "(empty folder)"
-                return AssistantResponse(
-                    intent=intent,
-                    answer_text=f"Folder {context.open_folder_path or '.'} has {len(listing.entries)} item(s):\n{top}",
-                    used_context=used_context + ["open folder"],
-                )
-            except FileOperationError as exc:
-                return AssistantResponse(intent=intent, answer_text=str(exc), used_context=used_context)
-
-        return AssistantResponse(intent=intent, answer_text="Tell me what file to read/summarize, or provide a search phrase.", used_context=used_context)
-
-    def _handle_file_action(
-        self,
-        request_text: str,
-        lowered: str,
-        context: AssistantContext,
-        intent: AssistantIntent,
-    ) -> AssistantResponse:
-        used_context = self._context_labels(context)
-        root = context.selected_root
-        if not root:
-            return AssistantResponse(intent=intent, answer_text="Select an approved root folder first.", used_context=used_context)
-        if "delete" in lowered:
-            if not context.selected_file_path:
-                return AssistantResponse(intent=intent, answer_text="Select a file first, then ask to delete it.", used_context=used_context)
-            proposal = AssistantActionProposal(
-                action_type="file_delete",
-                title=f"Delete file {context.selected_file_path}",
-                parameters={"root": root, "relative_path": context.selected_file_path},
-                requires_confirmation=True,
-            )
             return AssistantResponse(
-                intent=intent,
-                answer_text="I prepared a delete action proposal. It will require confirmation before execution.",
-                proposed_actions=[proposal],
-                used_context=used_context + ["selected file"],
-            )
-        if "move" in lowered:
-            if not context.selected_file_path:
-                return AssistantResponse(intent=intent, answer_text="Select a file first, then ask where to move it.", used_context=used_context)
-            destination = self._extract_destination_path(request_text)
-            if not destination:
-                return AssistantResponse(intent=intent, answer_text="I could not detect the destination path. Example: 'Move this file to Taxes/2026/receipt.txt'.", used_context=used_context)
-            proposal = AssistantActionProposal(
-                action_type="file_move",
-                title=f"Move file to {destination}",
-                parameters={
-                    "source_root": root,
-                    "source_relative_path": context.selected_file_path,
-                    "destination_root": root,
-                    "destination_relative_path": destination,
-                },
-                requires_confirmation=True,
-            )
-            return AssistantResponse(
-                intent=intent,
-                answer_text="I prepared a move action proposal. It will require confirmation before execution.",
-                proposed_actions=[proposal],
-                used_context=used_context + ["selected file"],
-            )
-        return AssistantResponse(
-            intent=intent,
-            answer_text="I can currently prepare file action proposals for move and delete requests.",
-            used_context=used_context,
-        )
-
-    def _handle_email_read_search(
-        self,
-        request_text: str,
-        lowered: str,
-        context: AssistantContext,
-        settings: AppSettings,
-        intent: AssistantIntent,
-    ) -> AssistantResponse:
-        used_context = self._context_labels(context)
-        if "what does this email" in lowered or ("summarize" in lowered and context.selected_email_uid):
-            if not context.selected_email_uid:
-                return AssistantResponse(intent=intent, answer_text="Select an email first.", used_context=used_context)
-            try:
-                summary = self._yahoo_service.summarize_email(context.selected_email_uid)
-                return AssistantResponse(
-                    intent=intent,
-                    answer_text=f"Here is what the selected email wants:\n\n{summary}",
-                    used_context=used_context + ["selected email"],
-                )
-            except YahooMailError as exc:
-                return AssistantResponse(intent=intent, answer_text=str(exc), used_context=used_context)
-
-        query = self._extract_search_query(request_text)
-        try:
-            messages = self._yahoo_service.list_inbox(subject_keyword=query if query else "")
-            if not messages:
-                return AssistantResponse(intent=intent, answer_text="I found no matching emails.", used_context=used_context)
-            bullets = self._render_mail_list(messages)
-            return AssistantResponse(intent=intent, answer_text=f"Top Yahoo results:\n{bullets}", used_context=used_context)
-        except YahooMailError as exc:
-            return AssistantResponse(intent=intent, answer_text=str(exc), used_context=used_context)
-
-    def _handle_email_draft(
-        self,
-        request_text: str,
-        lowered: str,
-        context: AssistantContext,
-        settings: AppSettings,
-        intent: AssistantIntent,
-    ) -> AssistantResponse:
-        used_context = self._context_labels(context)
-        if "send" in lowered:
-            proposal = AssistantActionProposal(
-                action_type="email_send",
-                title="Send current draft email",
-                parameters={},
-                requires_confirmation=True,
-            )
-            return AssistantResponse(
-                intent=intent,
-                answer_text="I prepared a send proposal. Sending always requires explicit confirmation.",
-                proposed_actions=[proposal],
+                intent=AssistantIntent.AGENT,
+                answer_text="I could not complete this request because the AI response was missing both tool calls and a final answer.",
+                proposed_actions=proposals,
                 used_context=used_context,
             )
 
-        if "reply" in lowered and context.selected_email_uid:
-            note = self._extract_after_keyword(request_text, "saying") or request_text
-            try:
-                draft = self._yahoo_service.draft_reply(context.selected_email_uid, note)
+        return AssistantResponse(
+            intent=AssistantIntent.AGENT,
+            answer_text=(
+                "I stopped after several tool steps to stay safe. Please retry with a narrower request, "
+                "or run the action manually in the Files or Yahoo Mail tabs."
+            ),
+            proposed_actions=proposals,
+            used_context=used_context,
+        )
+
+    def _plan_with_ai(
+        self,
+        request_text: str,
+        context: AssistantContext,
+        settings: AppSettings,
+        steps: list[_AgentStep],
+        step_number: int,
+    ) -> dict[str, Any]:
+        payload = {
+            "request": request_text,
+            "context": {
+                "selected_approved_root": context.selected_root,
+                "current_folder_path": context.open_folder_path,
+                "selected_file_path": context.selected_file_path,
+                "selected_email_uid": context.selected_email_uid,
+                "selected_email_subject": context.selected_email_subject,
+                "available_tools": list(self._SAFE_TOOLS),
+            },
+            "step_number": step_number,
+            "prior_tool_results": [
+                {
+                    "tool": step.tool_name,
+                    "args": step.args,
+                    "result": step.result,
+                }
+                for step in steps
+            ],
+        }
+
+        system_prompt = (
+            "You are a safe desktop assistant. Use tools for file and Yahoo mail tasks. "
+            "Never request shell commands. Return strict JSON only."
+        )
+        user_prompt = (
+            "Return only JSON with this schema: "
+            '{"intent":"string","tool_calls":[{"name":"tool_name","arguments":{}}],'
+            '"final_answer":"plain english string","proposed_actions":[],"needs_confirmation":bool}. '
+            "Rules: If tools are needed, fill tool_calls and leave final_answer empty. "
+            "If ready to answer user, set final_answer and tool_calls=[]. "
+            "For destructive/external actions (delete/move/overwrite/send_email), still use tool_calls.\n\n"
+            f"Input JSON:\n{json.dumps(payload, indent=2)}"
+        )
+
+        try:
+            raw = self._ai_client.generate_text(settings=settings, system_prompt=system_prompt, user_prompt=user_prompt)
+        except (AIUnavailableError, AIClientError) as exc:
+            return {
+                "intent": "error",
+                "tool_calls": [],
+                "final_answer": f"AI is unavailable right now: {exc}",
+                "proposed_actions": [],
+                "needs_confirmation": False,
+            }
+
+        parsed = self._parse_structured_output(raw)
+        if parsed:
+            return parsed
+
+        repair_prompt = (
+            "Your previous response was invalid. Repair it. Return strict JSON only with keys: "
+            'intent, tool_calls, final_answer, proposed_actions, needs_confirmation. '
+            "Do not add markdown fences.\n\n"
+            f"Invalid response:\n{raw}"
+        )
+        try:
+            repaired = self._ai_client.generate_text(
+                settings=settings,
+                system_prompt="Return strict JSON only.",
+                user_prompt=repair_prompt,
+            )
+        except (AIUnavailableError, AIClientError) as exc:
+            return {
+                "intent": "error",
+                "tool_calls": [],
+                "final_answer": (
+                    "I could not parse the local model response and repair also failed: "
+                    f"{exc}. Please try again with a shorter request."
+                ),
+                "proposed_actions": [],
+                "needs_confirmation": False,
+            }
+
+        repaired_parsed = self._parse_structured_output(repaired)
+        if repaired_parsed:
+            return repaired_parsed
+        return {
+            "intent": "error",
+            "tool_calls": [],
+            "final_answer": (
+                "I could not parse the model response into the required assistant format. "
+                "Try a shorter request or a different model."
+            ),
+            "proposed_actions": [],
+            "needs_confirmation": False,
+        }
+
+    def _parse_structured_output(self, raw_text: str) -> dict[str, Any] | None:
+        text = raw_text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+        try:
+            candidate = json.loads(text)
+        except json.JSONDecodeError:
+            candidate = self._try_parse_first_json_object(text)
+        if not isinstance(candidate, dict):
+            return None
+
+        tool_calls = candidate.get("tool_calls", [])
+        if tool_calls is None:
+            tool_calls = []
+        if not isinstance(tool_calls, list):
+            return None
+
+        normalized = {
+            "intent": str(candidate.get("intent", "general")),
+            "tool_calls": tool_calls,
+            "final_answer": str(candidate.get("final_answer", "")).strip(),
+            "proposed_actions": candidate.get("proposed_actions", []),
+            "needs_confirmation": bool(candidate.get("needs_confirmation", False)),
+        }
+        return normalized
+
+    def _try_parse_first_json_object(self, text: str) -> dict[str, Any] | None:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        snippet = text[start : end + 1]
+        try:
+            parsed = json.loads(snippet)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _execute_tool_call(self, tool_call: Any, context: AssistantContext) -> dict[str, Any]:
+        if not isinstance(tool_call, dict):
+            return {"ok": False, "error": "Tool call must be an object.", "tool_name": "unknown", "args": {}}
+        tool_name = str(tool_call.get("name", "")).strip()
+        args = tool_call.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        if tool_name not in self._SAFE_TOOLS:
+            return {"ok": False, "error": f"Tool not allowed: {tool_name}", "tool_name": tool_name, "args": args}
+
+        try:
+            if tool_name == "list_directory":
+                root = self._required_root(context, args)
+                relative_path = str(args.get("relative_path") or context.open_folder_path or "")
+                listing = self._file_service.list_directory(root, relative_path)
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "result": {
+                        "root": listing.root,
+                        "relative_path": listing.relative_path,
+                        "entries": [
+                            {"relative_path": item.relative_path, "is_dir": item.is_dir, "size": item.size}
+                            for item in listing.entries[:100]
+                        ],
+                    },
+                }
+            if tool_name == "search_files":
+                root = self._required_root(context, args)
+                query = str(args.get("query", "")).strip()
+                matches = self._file_service.search_files(root, query)
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "result": {
+                        "query": query,
+                        "count": len(matches),
+                        "matches": [item.relative_path for item in matches[:100]],
+                    },
+                }
+            if tool_name == "read_file":
+                root = self._required_root(context, args)
+                relative_path = self._required_relative_path(context, args, "relative_path", "selected_file_path")
+                data = self._file_service.read_file(root, relative_path)
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "result": {"relative_path": data.relative_path, "content": data.content[:12000]},
+                }
+            if tool_name == "summarize_file":
+                root = self._required_root(context, args)
+                relative_path = self._required_relative_path(context, args, "relative_path", "selected_file_path")
+                summary = self._file_service.summarize_file(root, relative_path)
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "result": {"relative_path": relative_path, "summary": summary},
+                }
+            if tool_name == "create_file":
+                root = self._required_root(context, args)
+                relative_path = str(args.get("relative_path", "")).strip()
+                content = str(args.get("content", ""))
+                created_path = self._file_service.create_file(root, relative_path, content)
+                return {"ok": True, "tool_name": tool_name, "args": args, "result": {"created_path": created_path}}
+            if tool_name == "rename_file":
+                root = self._required_root(context, args)
+                relative_path = self._required_relative_path(context, args, "relative_path", "selected_file_path")
+                new_name = str(args.get("new_name", "")).strip()
+                renamed_path = self._file_service.rename_file(root, relative_path, new_name)
+                return {"ok": True, "tool_name": tool_name, "args": args, "result": {"renamed_path": renamed_path}}
+            if tool_name == "copy_file":
+                source_root = str(args.get("source_root") or context.selected_root).strip()
+                source_relative = self._required_relative_path(context, args, "source_relative_path", "selected_file_path")
+                destination_root = str(args.get("destination_root") or source_root).strip()
+                destination_relative = str(args.get("destination_relative_path", "")).strip()
+                overwrite = bool(args.get("overwrite", False))
+                if overwrite:
+                    return {
+                        "ok": True,
+                        "tool_name": tool_name,
+                        "args": args,
+                        "proposal": AssistantActionProposal(
+                            action_type="file_copy",
+                            title=f"Copy file to {destination_relative} (overwrite)",
+                            parameters={
+                                "source_root": source_root,
+                                "source_relative_path": source_relative,
+                                "destination_root": destination_root,
+                                "destination_relative_path": destination_relative,
+                                "overwrite": "true",
+                            },
+                            requires_confirmation=True,
+                        ),
+                        "result": {"status": "confirmation_required"},
+                    }
+                copied_path = self._file_service.copy_file(source_root, source_relative, destination_root, destination_relative, overwrite=False)
+                return {"ok": True, "tool_name": tool_name, "args": args, "result": {"copied_path": copied_path}}
+            if tool_name == "move_file":
+                source_root = str(args.get("source_root") or context.selected_root).strip()
+                source_relative = self._required_relative_path(context, args, "source_relative_path", "selected_file_path")
+                destination_root = str(args.get("destination_root") or source_root).strip()
+                destination_relative = str(args.get("destination_relative_path", "")).strip()
+                proposal = AssistantActionProposal(
+                    action_type="file_move",
+                    title=f"Move file to {destination_relative}",
+                    parameters={
+                        "source_root": source_root,
+                        "source_relative_path": source_relative,
+                        "destination_root": destination_root,
+                        "destination_relative_path": destination_relative,
+                    },
+                    requires_confirmation=True,
+                )
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "proposal": proposal,
+                    "result": {"status": "confirmation_required"},
+                }
+            if tool_name == "delete_file":
+                root = self._required_root(context, args)
+                relative_path = self._required_relative_path(context, args, "relative_path", "selected_file_path")
+                proposal = AssistantActionProposal(
+                    action_type="file_delete",
+                    title=f"Delete file {relative_path}",
+                    parameters={"root": root, "relative_path": relative_path},
+                    requires_confirmation=True,
+                )
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "proposal": proposal,
+                    "result": {"status": "confirmation_required"},
+                }
+            if tool_name == "list_inbox":
+                unread_raw = str(args.get("unread", "")).strip().lower()
+                unread_only: bool | None
+                if unread_raw == "unread":
+                    unread_only = True
+                elif unread_raw == "read":
+                    unread_only = False
+                else:
+                    unread_only = None
+                limit = int(args.get("limit", 25))
+                messages = self._yahoo_service.list_inbox(
+                    unread_only=unread_only,
+                    sender=str(args.get("sender", "")),
+                    subject_keyword=str(args.get("subject_keyword", "")),
+                    limit=max(1, min(limit, 50)),
+                )
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "result": {
+                        "count": len(messages),
+                        "emails": [
+                            {
+                                "uid": message.uid,
+                                "subject": message.subject,
+                                "sender": message.sender,
+                                "received_at": message.received_at,
+                                "unread": message.unread,
+                            }
+                            for message in messages
+                        ],
+                    },
+                }
+            if tool_name == "read_email":
+                uid = str(args.get("uid") or context.selected_email_uid).strip()
+                message = self._yahoo_service.read_email(uid)
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "result": {
+                        "uid": message.uid,
+                        "subject": message.subject,
+                        "sender": message.sender,
+                        "received_at": message.received_at,
+                        "body_text": message.body_text[:12000],
+                    },
+                }
+            if tool_name == "summarize_email":
+                uid = str(args.get("uid") or context.selected_email_uid).strip()
+                summary = self._yahoo_service.summarize_email(uid)
+                return {"ok": True, "tool_name": tool_name, "args": args, "result": {"uid": uid, "summary": summary}}
+            if tool_name == "draft_reply":
+                uid = str(args.get("uid") or context.selected_email_uid).strip()
+                notes = str(args.get("notes", ""))
+                draft = self._yahoo_service.draft_reply(uid, notes)
                 proposal = AssistantActionProposal(
                     action_type="email_use_draft",
                     title="Apply drafted reply to editor",
                     parameters={"to": draft.to_address, "subject": draft.subject, "body": draft.body},
                     requires_confirmation=False,
                 )
-                return AssistantResponse(
-                    intent=intent,
-                    answer_text="I drafted a reply. Review it before sending.",
-                    proposed_actions=[proposal],
-                    used_context=used_context + ["selected email"],
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "proposal": proposal,
+                    "result": {"status": "draft_ready", "to": draft.to_address, "subject": draft.subject},
+                }
+            if tool_name == "draft_new_email":
+                to_address = str(args.get("to_address", "")).strip()
+                subject = str(args.get("subject", "")).strip()
+                notes = str(args.get("notes", ""))
+                draft = self._yahoo_service.draft_new_email(to_address, subject, notes)
+                proposal = AssistantActionProposal(
+                    action_type="email_use_draft",
+                    title="Apply drafted email to editor",
+                    parameters={"to": draft.to_address, "subject": draft.subject, "body": draft.body},
+                    requires_confirmation=False,
                 )
-            except YahooMailError as exc:
-                return AssistantResponse(intent=intent, answer_text=str(exc), used_context=used_context)
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "proposal": proposal,
+                    "result": {"status": "draft_ready", "to": draft.to_address, "subject": draft.subject},
+                }
+            if tool_name == "send_email":
+                to_address = str(args.get("to_address", "")).strip()
+                subject = str(args.get("subject", "")).strip()
+                body = str(args.get("body", "")).strip()
+                use_current = bool(args.get("use_current_draft", False))
+                parameters = {"use_current_draft": "true"} if use_current else {
+                    "to": to_address,
+                    "subject": subject,
+                    "body": body,
+                }
+                proposal = AssistantActionProposal(
+                    action_type="email_send",
+                    title="Send drafted email",
+                    parameters=parameters,
+                    requires_confirmation=True,
+                )
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "proposal": proposal,
+                    "result": {"status": "confirmation_required"},
+                }
+        except (FileOperationError, YahooMailError, ValueError) as exc:
+            return {"ok": False, "tool_name": tool_name, "args": args, "error": str(exc)}
 
-        to_address, subject = self._extract_email_targets(request_text)
-        note = self._extract_after_keyword(request_text, "saying") or request_text
-        try:
-            draft = self._yahoo_service.draft_new_email(to_address, subject, note)
-            proposal = AssistantActionProposal(
-                action_type="email_use_draft",
-                title="Apply drafted email to editor",
-                parameters={"to": draft.to_address, "subject": draft.subject, "body": draft.body},
-                requires_confirmation=False,
-            )
-            return AssistantResponse(
-                intent=intent,
-                answer_text="I drafted a new email. Review it before sending.",
-                proposed_actions=[proposal],
-                used_context=used_context,
-            )
-        except YahooMailError as exc:
-            return AssistantResponse(intent=intent, answer_text=str(exc), used_context=used_context)
+        return {"ok": False, "tool_name": tool_name, "args": args, "error": f"Unhandled tool: {tool_name}"}
 
-    def _extract_search_query(self, request_text: str) -> str:
-        matched = re.search(r"(?:mention|mentions|for|about)\s+(.+)$", request_text, flags=re.IGNORECASE)
-        if matched:
-            return matched.group(1).strip(" .?!\"")
-        quoted = re.search(r'"([^"]+)"', request_text)
-        if quoted:
-            return quoted.group(1).strip()
-        return ""
+    def _required_root(self, context: AssistantContext, args: dict[str, Any]) -> str:
+        root = str(args.get("root") or context.selected_root).strip()
+        if not root:
+            raise ValueError("No approved root is selected.")
+        return root
 
-    def _extract_destination_path(self, request_text: str) -> str:
-        matched = re.search(r"\bto\b\s+(.+)$", request_text, flags=re.IGNORECASE)
-        if not matched:
-            return ""
-        return matched.group(1).strip(" .?!\"")
-
-    def _extract_after_keyword(self, request_text: str, keyword: str) -> str:
-        matched = re.search(rf"\b{re.escape(keyword)}\b\s+(.+)$", request_text, flags=re.IGNORECASE)
-        return matched.group(1).strip() if matched else ""
-
-    def _extract_email_targets(self, request_text: str) -> tuple[str, str]:
-        mail = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", request_text)
-        subject = ""
-        subject_match = re.search(r"subject\s*[:=]\s*([^\n]+)", request_text, flags=re.IGNORECASE)
-        if subject_match:
-            subject = subject_match.group(1).strip()
-        return (mail.group(0) if mail else "", subject)
-
-    def _render_mail_list(self, messages: list[MailSummary]) -> str:
-        return "\n".join(f"- {m.received_at} | {m.sender} | {m.subject}" for m in messages[:12])
+    def _required_relative_path(
+        self,
+        context: AssistantContext,
+        args: dict[str, Any],
+        arg_key: str,
+        context_field: str,
+    ) -> str:
+        context_value = getattr(context, context_field)
+        value = str(args.get(arg_key) or context_value).strip()
+        if not value:
+            raise ValueError(f"Missing required path: {arg_key}")
+        return value
 
     def _context_labels(self, context: AssistantContext) -> list[str]:
         labels: list[str] = []
+        if context.selected_root:
+            labels.append(f"selected root {context.selected_root}")
         if context.selected_file_path:
             labels.append(f"selected file {context.selected_file_path}")
         if context.open_folder_path:
