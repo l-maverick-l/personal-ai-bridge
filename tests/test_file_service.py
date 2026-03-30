@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.ai.client import AIClient
 from app.data.action_log import ActionLogger
@@ -102,6 +103,38 @@ class FileServiceTestCase(unittest.TestCase):
             self.service.create_file(str(self.root), "blank.docx", "")
         with self.assertRaises(FileOperationError):
             self.service.create_file(str(self.root), "blank.pdf", "")
+
+    def test_read_doc_uses_fallback_extractors(self) -> None:
+        doc_file = self.root / "legacy.doc"
+        doc_file.write_bytes(b"legacy")
+
+        with (
+            patch.object(self.service, "_read_doc_with_word_com", side_effect=FileOperationError("word missing")),
+            patch.object(self.service, "_read_doc_with_libreoffice", return_value="Converted via libreoffice"),
+            patch.object(self.service, "_read_doc_with_antiword") as antiword_mock,
+        ):
+            result = self.service.read_file(str(self.root), "legacy.doc")
+
+        self.assertEqual(result.content, "Converted via libreoffice")
+        antiword_mock.assert_not_called()
+
+    def test_read_doc_reports_clear_dependency_message_when_all_extractors_fail(self) -> None:
+        doc_file = self.root / "legacy.doc"
+        doc_file.write_bytes(b"legacy")
+
+        with (
+            patch.object(self.service, "_read_doc_with_word_com", side_effect=FileOperationError("word unavailable")),
+            patch.object(self.service, "_read_doc_with_libreoffice", side_effect=FileOperationError("libreoffice missing")),
+            patch.object(self.service, "_read_doc_with_antiword", side_effect=FileOperationError("antiword missing")),
+        ):
+            with self.assertRaises(FileOperationError) as context:
+                self.service.read_file(str(self.root), "legacy.doc")
+
+        message = str(context.exception).lower()
+        self.assertIn("legacy .doc", message)
+        self.assertIn("install at least one supported extractor", message)
+        self.assertIn("libreoffice", message)
+        self.assertIn("antiword", message)
 
 
 if __name__ == "__main__":
