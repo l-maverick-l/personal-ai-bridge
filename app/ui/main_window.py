@@ -64,6 +64,9 @@ class MainWindow(QMainWindow):
         self._current_email: MailMessageView | None = None
         self._allow_remote_images_current_message = False
         self._search_view_item_role = Qt.ItemDataRole.UserRole + 1
+        self._folder_view_root = ""
+        self._folder_view_relative_path = ""
+        self._folder_view_history: list[str] = []
 
         self.setWindowTitle("Personal AI Bridge")
         self.resize(1500, 900)
@@ -399,6 +402,19 @@ class MainWindow(QMainWindow):
         search_view_layout = QVBoxLayout(search_view_widget)
         self.search_context_label = QLabel("Folder listings and file search results appear below.")
         self.search_context_label.setWordWrap(True)
+        navigation_layout = QHBoxLayout()
+        self.search_back_button = QPushButton("Back")
+        self.search_back_button.clicked.connect(self._navigate_back_folder_view)
+        self.search_up_button = QPushButton("Up")
+        self.search_up_button.clicked.connect(self._navigate_up_folder_view)
+        self.search_root_button = QPushButton("Root")
+        self.search_root_button.clicked.connect(self._navigate_root_folder_view)
+        self.search_path_label = QLabel("Current folder: (not selected)")
+        self.search_path_label.setWordWrap(True)
+        navigation_layout.addWidget(self.search_back_button)
+        navigation_layout.addWidget(self.search_up_button)
+        navigation_layout.addWidget(self.search_root_button)
+        navigation_layout.addWidget(self.search_path_label, 1)
         self.search_context_tree = QTreeWidget()
         self.search_context_tree.setHeaderLabels(["Type", "Relative path", "Size"])
         self.search_context_tree.setRootIsDecorated(False)
@@ -408,6 +424,7 @@ class MainWindow(QMainWindow):
         self.search_context_tree.itemDoubleClicked.connect(self._search_item_double_clicked)
         self.search_context_tree.customContextMenuRequested.connect(self._show_search_item_context_menu)
         search_view_layout.addWidget(self.search_context_label)
+        search_view_layout.addLayout(navigation_layout)
         search_view_layout.addWidget(self.search_context_tree)
         tabs.addTab(preview_widget, "Email preview")
         tabs.addTab(self.file_preview, "File preview")
@@ -453,6 +470,8 @@ class MainWindow(QMainWindow):
         self._restore_combo_value(self.destination_root_selector, destination_root or current_root)
         self.root_selector.blockSignals(False)
         self.destination_root_selector.blockSignals(False)
+        self._validate_folder_navigation_state()
+        self._update_folder_navigation_controls()
 
         self.recent_commands.clear()
         for entry in self._context.action_logger.recent_entries(limit=10):
@@ -988,6 +1007,9 @@ class MainWindow(QMainWindow):
 
     def _show_directory_listing(self, listing: DirectoryListing) -> None:
         self.search_context_label.setText(f"Folder listing for {listing.root}:{listing.relative_path or '.'}")
+        self._folder_view_root = listing.root
+        self._folder_view_relative_path = listing.relative_path
+        self._update_folder_navigation_controls()
         self.search_context_tree.clear()
         for entry in listing.entries:
             self._append_search_item(
@@ -1045,7 +1067,11 @@ class MainWindow(QMainWindow):
         self.path_input.setText(item_data.relative_path)
         self._restore_combo_value(self.root_selector, item_data.approved_root)
         if item_data.is_dir:
-            self.list_selected_folder()
+            self._navigate_to_folder(
+                root=item_data.approved_root,
+                relative_path=item_data.relative_path,
+                push_history=True,
+            )
             return
         try:
             read_result = self._context.file_service.read_file(item_data.approved_root, item_data.relative_path)
@@ -1059,8 +1085,11 @@ class MainWindow(QMainWindow):
         if not item_data:
             return
         if item_data.is_dir:
-            self.path_input.setText(item_data.relative_path)
-            self.list_selected_folder()
+            self._navigate_to_folder(
+                root=item_data.approved_root,
+                relative_path=item_data.relative_path,
+                push_history=True,
+            )
         else:
             self.path_input.setText(item_data.relative_path)
             self.read_selected_file()
@@ -1132,3 +1161,80 @@ class MainWindow(QMainWindow):
     def _root_changed(self) -> None:
         if not self.destination_root_selector.currentText().strip() and self.root_selector.count() > 0:
             self.destination_root_selector.setCurrentIndex(self.root_selector.currentIndex())
+        selected_root = self.root_selector.currentText().strip()
+        if not selected_root:
+            self._reset_folder_navigation_state()
+            self._update_folder_navigation_controls()
+            return
+        self._folder_view_root = selected_root
+        self._folder_view_relative_path = ""
+        self._folder_view_history.clear()
+        self.path_input.setText("")
+        self.list_selected_folder()
+
+    def _navigate_to_folder(self, root: str, relative_path: str, push_history: bool) -> None:
+        previous_root = self._folder_view_root
+        previous_relative_path = self._folder_view_relative_path
+        if push_history and previous_root == root:
+            self._folder_view_history.append(previous_relative_path)
+        if previous_root and previous_root != root:
+            self._folder_view_history.clear()
+        self._restore_combo_value(self.root_selector, root)
+        self.path_input.setText(relative_path)
+        self.list_selected_folder()
+
+    def _navigate_back_folder_view(self) -> None:
+        if not self._folder_view_history:
+            return
+        previous_relative_path = self._folder_view_history.pop()
+        root = self._folder_view_root or self._selected_root()
+        if not root:
+            return
+        self._navigate_to_folder(root=root, relative_path=previous_relative_path, push_history=False)
+        self._update_folder_navigation_controls()
+
+    def _navigate_up_folder_view(self) -> None:
+        root = self._folder_view_root or self._selected_root()
+        if not root:
+            return
+        if not self._folder_view_relative_path:
+            self._update_folder_navigation_controls()
+            return
+        parent = Path(self._folder_view_relative_path).parent.as_posix()
+        if parent == ".":
+            parent = ""
+        self._navigate_to_folder(root=root, relative_path=parent, push_history=True)
+
+    def _navigate_root_folder_view(self) -> None:
+        root = self._selected_root()
+        if not root:
+            return
+        self._folder_view_root = root
+        self._folder_view_relative_path = ""
+        self._folder_view_history.clear()
+        self.path_input.setText("")
+        self.list_selected_folder()
+
+    def _reset_folder_navigation_state(self) -> None:
+        self._folder_view_root = ""
+        self._folder_view_relative_path = ""
+        self._folder_view_history.clear()
+        self.search_path_label.setText("Current folder: (not selected)")
+
+    def _validate_folder_navigation_state(self) -> None:
+        current_roots = {self.root_selector.itemText(index) for index in range(self.root_selector.count())}
+        if self._folder_view_root and self._folder_view_root not in current_roots:
+            self._reset_folder_navigation_state()
+
+    def _update_folder_navigation_controls(self) -> None:
+        at_root = not self._folder_view_relative_path
+        has_back = bool(self._folder_view_history)
+        has_root = bool(self._folder_view_root)
+        self.search_back_button.setEnabled(has_back)
+        self.search_up_button.setEnabled(has_root and not at_root)
+        self.search_root_button.setEnabled(has_root)
+        if not has_root:
+            self.search_path_label.setText("Current folder: (not selected)")
+            return
+        display_relative = self._folder_view_relative_path or "."
+        self.search_path_label.setText(f"Current folder: {self._folder_view_root}:{display_relative}")
