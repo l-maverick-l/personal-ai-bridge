@@ -12,6 +12,8 @@ from email.message import EmailMessage, Message
 from email.utils import formataddr, make_msgid, parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Callable
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
 from app.ai.client import AIClient, AIClientError, AIUnavailableError
@@ -135,18 +137,60 @@ class _SafeHTMLSanitizer(HTMLParser):
     }
     _allowed_attrs = {
         "a": {"href", "title"},
-        "img": {"src", "alt", "title", "width", "height"},
+        "img": {"src", "alt", "title", "width", "height", "style"},
         "td": {"colspan", "rowspan", "align"},
         "th": {"colspan", "rowspan", "align"},
-        "p": {"align"},
-        "div": {"align"},
-        "span": set(),
-        "table": {"border", "cellpadding", "cellspacing", "width"},
+        "p": {"align", "style"},
+        "div": {"align", "style"},
+        "span": {"style"},
+        "table": {"border", "cellpadding", "cellspacing", "width", "style"},
+        "tbody": {"style"},
+        "thead": {"style"},
+        "tr": {"style"},
     }
 
-    def __init__(self, allow_remote_images: bool) -> None:
+    _allowed_style_props = {
+        "background",
+        "background-color",
+        "border",
+        "border-bottom",
+        "border-collapse",
+        "border-left",
+        "border-right",
+        "border-top",
+        "color",
+        "display",
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "height",
+        "line-height",
+        "margin",
+        "margin-bottom",
+        "margin-left",
+        "margin-right",
+        "margin-top",
+        "max-height",
+        "max-width",
+        "min-height",
+        "min-width",
+        "padding",
+        "padding-bottom",
+        "padding-left",
+        "padding-right",
+        "padding-top",
+        "text-align",
+        "text-decoration",
+        "vertical-align",
+        "white-space",
+        "width",
+    }
+
+    def __init__(self, allow_remote_images: bool, remote_image_loader: "_RemoteImageLoader | None" = None) -> None:
         super().__init__(convert_charrefs=True)
         self._allow_remote_images = allow_remote_images
+        self._remote_image_loader = remote_image_loader
         self._chunks: list[str] = []
         self._skip_depth = 0
 
@@ -169,11 +213,23 @@ class _SafeHTMLSanitizer(HTMLParser):
                 continue
             if attr == "href" and not self._is_safe_href(value):
                 continue
+            if attr == "style":
+                style_value = self._sanitize_style(value)
+                if not style_value:
+                    continue
+                escaped = self._escape(style_value)
+                kept_attrs.append(f'{attr}="{escaped}"')
+                continue
             if attr == "src":
                 if not self._is_safe_img_src(value):
                     continue
                 if self._is_remote(value) and not self._allow_remote_images:
                     continue
+                if self._is_remote(value) and self._allow_remote_images and self._remote_image_loader:
+                    data_url = self._remote_image_loader.load(value)
+                    if not data_url:
+                        continue
+                    value = data_url
             escaped = self._escape(value)
             kept_attrs.append(f'{attr}="{escaped}"')
 
@@ -228,6 +284,99 @@ class _SafeHTMLSanitizer(HTMLParser):
             .replace('"', "&quot;")
         )
 
+    def _sanitize_style(self, value: str) -> str:
+        cleaned: list[str] = []
+        for declaration in value.split(";"):
+            if ":" not in declaration:
+                continue
+            raw_prop, raw_val = declaration.split(":", 1)
+            prop = raw_prop.strip().lower()
+            if prop not in self._allowed_style_props:
+                continue
+            style_value = raw_val.strip()
+            if not style_value:
+                continue
+            lowered = style_value.lower()
+            if "url(" in lowered or "expression(" in lowered or "@import" in lowered or "javascript:" in lowered:
+                continue
+            if re.search(r"[^a-zA-Z0-9#%(),.\-+/\s'\"]", style_value):
+                continue
+            cleaned.append(f"{prop}: {style_value}")
+        return "; ".join(cleaned)
+
+
+class _RemoteImageLoader:
+    def __init__(
+        self,
+        url_opener: Callable[[Request, float], object],
+        timeout_seconds: float = 4.0,
+        max_images: int = 24,
+        max_bytes_per_image: int = 2_000_000,
+    ) -> None:
+        self._url_opener = url_opener
+        self._timeout_seconds = timeout_seconds
+        self._max_images = max_images
+        self._max_bytes_per_image = max_bytes_per_image
+        self._cache: dict[str, str | None] = {}
+        self._attempted = 0
+
+    def load(self, url: str) -> str | None:
+        normalized = url.strip()
+        if not normalized:
+            return None
+        if normalized in self._cache:
+            return self._cache[normalized]
+        if self._attempted >= self._max_images:
+            self._cache[normalized] = None
+            return None
+        self._attempted += 1
+        self._cache[normalized] = self._download_as_data_url(normalized)
+        return self._cache[normalized]
+
+    def _download_as_data_url(self, url: str) -> str | None:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "PersonalAIBridge/1.0 (email-preview)",
+                "Accept": "image/*,*/*;q=0.2",
+            },
+        )
+        try:
+            with self._url_opener(request, self._timeout_seconds) as response:
+                payload = response.read(self._max_bytes_per_image + 1)
+                if len(payload) > self._max_bytes_per_image:
+                    return None
+                content_type = getattr(response, "headers", {}).get("Content-Type", "")
+            mime_type = self._normalize_mime_type(content_type)
+            if not mime_type:
+                mime_type = self._guess_mime_type_from_url(url)
+            if not mime_type:
+                return None
+            encoded = base64.b64encode(payload).decode("ascii")
+            return f"data:{mime_type};base64,{encoded}"
+        except (TimeoutError, OSError, URLError, ValueError):
+            return None
+
+    def _normalize_mime_type(self, content_type_header: str) -> str:
+        if not content_type_header:
+            return ""
+        mime = content_type_header.split(";", 1)[0].strip().lower()
+        return mime if mime.startswith("image/") else ""
+
+    def _guess_mime_type_from_url(self, url: str) -> str:
+        path = urlsplit(url).path.lower()
+        if path.endswith(".png"):
+            return "image/png"
+        if path.endswith(".jpg") or path.endswith(".jpeg"):
+            return "image/jpeg"
+        if path.endswith(".gif"):
+            return "image/gif"
+        if path.endswith(".webp"):
+            return "image/webp"
+        if path.endswith(".svg"):
+            return "image/svg+xml"
+        return ""
+
 
 class YahooMailService:
     def __init__(
@@ -237,12 +386,14 @@ class YahooMailService:
         ai_client: AIClient,
         imap_factory: Callable[[str, int], imaplib.IMAP4_SSL] | None = None,
         smtp_factory: Callable[[str, int], smtplib.SMTP_SSL] | None = None,
+        remote_url_opener: Callable[[Request, float], object] | None = None,
     ) -> None:
         self._settings_store = settings_store
         self._action_logger = action_logger
         self._ai_client = ai_client
         self._imap_factory = imap_factory or imaplib.IMAP4_SSL
         self._smtp_factory = smtp_factory or smtplib.SMTP_SSL
+        self._remote_url_opener = remote_url_opener or urlopen
 
     def connection_status_text(self) -> str:
         settings = self._settings_store.load()
@@ -439,7 +590,8 @@ class YahooMailService:
 
     def build_safe_preview_html(self, message: MailMessageView, allow_remote_images: bool) -> str:
         if message.body_html.strip():
-            sanitizer = _SafeHTMLSanitizer(allow_remote_images=allow_remote_images)
+            loader = _RemoteImageLoader(self._remote_url_opener) if allow_remote_images else None
+            sanitizer = _SafeHTMLSanitizer(allow_remote_images=allow_remote_images, remote_image_loader=loader)
             sanitizer.feed(message.body_html)
             rendered_body = sanitizer.html().strip()
             if not rendered_body:
