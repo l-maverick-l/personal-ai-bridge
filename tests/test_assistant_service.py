@@ -107,6 +107,43 @@ class AssistantServiceTests(unittest.TestCase):
 
         self.assertEqual(response.answer_text, "Done.")
 
+    def test_root_folder_context_is_preserved(self) -> None:
+        assistant = self._assistant_with_ai(
+            [
+                '{"intent":"general","tool_calls":[],"final_answer":"Root summary.","proposed_actions":[],"needs_confirmation":false}',
+            ]
+        )
+
+        response = assistant.handle_request(
+            "What is in this folder?",
+            AssistantContext(selected_root=str(self.root), open_folder_path="."),
+            self.store.load(),
+        )
+
+        self.assertIn("open folder (approved root)", response.used_context)
+
+    def test_status_updates_are_emitted_during_agent_flow(self) -> None:
+        (self.root / "note.txt").write_text("hello", encoding="utf-8")
+        assistant = self._assistant_with_ai(
+            [
+                '{"intent":"file","tool_calls":[{"name":"search_files","arguments":{"query":"note"}}],"final_answer":"","proposed_actions":[],"needs_confirmation":false}',
+                '{"intent":"file","tool_calls":[],"final_answer":"I found note.txt.","proposed_actions":[],"needs_confirmation":false}',
+            ]
+        )
+        statuses: list[str] = []
+
+        assistant.handle_request(
+            "Find files mentioning note",
+            AssistantContext(selected_root=str(self.root)),
+            self.store.load(),
+            on_status=statuses.append,
+        )
+
+        self.assertIn("analyzing request", statuses)
+        self.assertIn("planning tools", statuses)
+        self.assertIn("running tool call", statuses)
+        self.assertIn("generating final answer", statuses)
+
 
 if __name__ == "__main__":
     unittest.main()

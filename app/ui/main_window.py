@@ -1240,8 +1240,11 @@ class MainWindow(QMainWindow):
                 request_text=request_text,
                 context=self._current_assistant_context(),
                 settings=self._settings,
+                on_status=on_status,
             ),
             on_success=self._assistant_request_succeeded,
+            on_status=self._assistant_status_update,
+            on_failure=self._assistant_request_failed,
         )
 
     def _assistant_request_succeeded(self, response) -> None:
@@ -1259,6 +1262,29 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, proposal)
             self.assistant_action_list.addItem(item)
 
+    def _assistant_status_update(self, text: str) -> None:
+        normalized = text.strip() or "running"
+        self.assistant_status_label.setText(f"Assistant status: {normalized}")
+
+    def _assistant_request_failed(self, error_details: dict[str, str]) -> None:
+        exception_type = error_details.get("exception_type", "Exception")
+        message = error_details.get("message") or "No error message was provided."
+        trace = error_details.get("traceback", "")
+        self.assistant_status_label.setText("Assistant status: failed")
+        ui_error = f"{exception_type}: {message}"
+        self._append_assistant_entry(
+            "Assistant",
+            "Request failed.\n"
+            f"{ui_error}\n\n"
+            "The technical traceback was logged for troubleshooting.",
+        )
+        self.results_output.setPlainText(ui_error)
+        if trace:
+            self._logger.error("Assistant request failed: %s\n%s", ui_error, trace)
+        else:
+            self._logger.error("Assistant request failed without traceback details: %s", ui_error)
+        self.refresh_ui()
+
     def _append_assistant_entry(self, role: str, body: str) -> None:
         existing = self.assistant_history.toHtml()
         escaped = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
@@ -1267,10 +1293,13 @@ class MainWindow(QMainWindow):
 
     def _current_assistant_context(self) -> AssistantContext:
         selected_mail = self._selected_mail_summary()
+        current_folder_context = self._folder_view_relative_path
+        if self._folder_view_root and not current_folder_context:
+            current_folder_context = "."
         return AssistantContext(
             selected_root=self.root_selector.currentText().strip(),
             selected_file_path=self.path_input.text().strip(),
-            open_folder_path=self._folder_view_relative_path,
+            open_folder_path=current_folder_context,
             selected_email_uid=selected_mail.uid if selected_mail else (self._current_email.uid if self._current_email else ""),
             selected_email_subject=selected_mail.subject if selected_mail else (self._current_email.subject if self._current_email else ""),
         )
@@ -1391,6 +1420,8 @@ class MainWindow(QMainWindow):
         on_success,
         stream_to_results: bool = False,
         stream_to_draft: bool = False,
+        on_status=None,
+        on_failure=None,
     ) -> None:
         if self._ai_thread and self._ai_thread.isRunning():
             self._show_result("Another AI task is still running. Cancel it or wait for it to finish.")
@@ -1402,12 +1433,17 @@ class MainWindow(QMainWindow):
         worker = AIWorker(task)
         worker.moveToThread(thread)
         worker.status.connect(lambda text: self.ai_progress_label.setText(f"AI status: {text}"))
+        if on_status:
+            worker.status.connect(on_status)
         if stream_to_results:
             worker.partial.connect(lambda text: self.results_output.setPlainText(text))
         if stream_to_draft:
             worker.partial.connect(lambda text: self.draft_body_input.setPlainText(text))
         worker.completed.connect(on_success)
-        worker.failed.connect(lambda message: self._show_error(f"{task_name} failed", RuntimeError(message)))
+        if on_failure:
+            worker.failed.connect(on_failure)
+        else:
+            worker.failed.connect(lambda error: self._show_error(f"{task_name} failed", self._failure_to_exception(error)))
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -1438,6 +1474,13 @@ class MainWindow(QMainWindow):
         self.results_output.setPlainText(str(exc))
         QMessageBox.warning(self, title, str(exc))
         self.refresh_ui()
+
+    def _failure_to_exception(self, failure) -> Exception:
+        if isinstance(failure, dict):
+            exception_type = str(failure.get("exception_type") or "Exception")
+            message = str(failure.get("message") or "No error message was provided.")
+            return RuntimeError(f"{exception_type}: {message}")
+        return RuntimeError(str(failure))
 
     def _set_pending_action(self, message: str, action: Callable[[], None]) -> None:
         self._pending_action = action
