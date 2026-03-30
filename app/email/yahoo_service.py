@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import email
 import imaplib
 import re
@@ -11,6 +12,7 @@ from email.message import EmailMessage, Message
 from email.utils import formataddr, make_msgid, parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Callable
+from urllib.parse import urlsplit
 
 from app.ai.client import AIClient, AIClientError, AIUnavailableError
 from app.data.action_log import ActionLogger
@@ -47,6 +49,22 @@ class MailSummary:
 
 
 @dataclass(slots=True)
+class InlineImageMeta:
+    content_id: str
+    content_type: str
+    filename: str
+    size: int
+
+
+@dataclass(slots=True)
+class AttachmentMeta:
+    filename: str
+    content_type: str
+    size: int
+    disposition: str
+
+
+@dataclass(slots=True)
 class MailMessageView:
     uid: str
     subject: str
@@ -55,6 +73,9 @@ class MailMessageView:
     received_at: str
     unread: bool
     body_text: str
+    body_html: str
+    inline_images: list[InlineImageMeta]
+    attachments: list[AttachmentMeta]
 
 
 @dataclass(slots=True)
@@ -77,6 +98,135 @@ class _HTMLTextExtractor(HTMLParser):
 
     def text(self) -> str:
         return "\n".join(self._chunks)
+
+
+class _SafeHTMLSanitizer(HTMLParser):
+    _allowed_tags = {
+        "a",
+        "p",
+        "br",
+        "div",
+        "span",
+        "strong",
+        "b",
+        "em",
+        "i",
+        "u",
+        "blockquote",
+        "pre",
+        "code",
+        "ul",
+        "ol",
+        "li",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "th",
+        "td",
+        "img",
+        "hr",
+    }
+    _allowed_attrs = {
+        "a": {"href", "title"},
+        "img": {"src", "alt", "title", "width", "height"},
+        "td": {"colspan", "rowspan", "align"},
+        "th": {"colspan", "rowspan", "align"},
+        "p": {"align"},
+        "div": {"align"},
+        "span": set(),
+        "table": {"border", "cellpadding", "cellspacing", "width"},
+    }
+
+    def __init__(self, allow_remote_images: bool) -> None:
+        super().__init__(convert_charrefs=True)
+        self._allow_remote_images = allow_remote_images
+        self._chunks: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        lowered = tag.lower()
+        if lowered in {"script", "style", "iframe", "object", "embed"}:
+            self._skip_depth += 1
+            return
+        if self._skip_depth > 0 or lowered not in self._allowed_tags:
+            return
+
+        allowed = self._allowed_attrs.get(lowered, set())
+        kept_attrs: list[str] = []
+        for name, raw_value in attrs:
+            attr = (name or "").lower()
+            value = raw_value or ""
+            if attr.startswith("on"):
+                continue
+            if attr not in allowed:
+                continue
+            if attr == "href" and not self._is_safe_href(value):
+                continue
+            if attr == "src":
+                if not self._is_safe_img_src(value):
+                    continue
+                if self._is_remote(value) and not self._allow_remote_images:
+                    continue
+            escaped = self._escape(value)
+            kept_attrs.append(f'{attr}="{escaped}"')
+
+        attrs_text = f" {' '.join(kept_attrs)}" if kept_attrs else ""
+        self._chunks.append(f"<{lowered}{attrs_text}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if lowered in {"script", "style", "iframe", "object", "embed"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+            return
+        if self._skip_depth > 0 or lowered not in self._allowed_tags:
+            return
+        self._chunks.append(f"</{lowered}>")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self._chunks.append(self._escape(data))
+
+    def handle_entityref(self, name: str) -> None:
+        if self._skip_depth == 0:
+            self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if self._skip_depth == 0:
+            self._chunks.append(f"&#{name};")
+
+    def html(self) -> str:
+        return "".join(self._chunks)
+
+    def _is_safe_href(self, value: str) -> bool:
+        parsed = urlsplit(value.strip())
+        scheme = parsed.scheme.lower()
+        return scheme in {"", "http", "https", "mailto"}
+
+    def _is_safe_img_src(self, value: str) -> bool:
+        parsed = urlsplit(value.strip())
+        scheme = parsed.scheme.lower()
+        if scheme in {"", "http", "https", "data"}:
+            return True
+        return False
+
+    def _is_remote(self, value: str) -> bool:
+        scheme = urlsplit(value.strip()).scheme.lower()
+        return scheme in {"http", "https"}
+
+    def _escape(self, value: str) -> str:
+        return (
+            value.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
 
 
 class YahooMailService:
@@ -287,6 +437,35 @@ class YahooMailService:
             self._record("email_send", draft.to_address, "error", str(user_error))
             raise user_error from exc
 
+    def build_safe_preview_html(self, message: MailMessageView, allow_remote_images: bool) -> str:
+        if message.body_html.strip():
+            sanitizer = _SafeHTMLSanitizer(allow_remote_images=allow_remote_images)
+            sanitizer.feed(message.body_html)
+            rendered_body = sanitizer.html().strip()
+            if not rendered_body:
+                rendered_body = "<p>(HTML body became empty after safety filtering.)</p>"
+        else:
+            rendered_body = f"<pre>{self._escape_html(message.body_text)}</pre>"
+
+        remote_note = ""
+        if message.body_html and not allow_remote_images:
+            remote_note = (
+                "<p><i>Remote images are blocked for privacy. "
+                "Use 'Load remote images' to enable them for this message.</i></p>"
+            )
+
+        return (
+            "<html><body>"
+            f"<h3>{self._escape_html(message.subject)}</h3>"
+            f"<p><b>From:</b> {self._escape_html(message.sender)}<br>"
+            f"<b>To:</b> {self._escape_html(message.recipients)}<br>"
+            f"<b>Date:</b> {self._escape_html(message.received_at)}</p>"
+            f"{remote_note}"
+            "<hr>"
+            f"{rendered_body}"
+            "</body></html>"
+        )
+
     def _fetch_summary(self, mailbox: imaplib.IMAP4_SSL, uid: str) -> MailSummary:
         status, data = mailbox.uid("FETCH", uid, LIST_HEADERS)
         self._ensure_ok(status, data, "Could not load message headers")
@@ -302,6 +481,7 @@ class YahooMailService:
         )
 
     def _build_message_view(self, uid: str, parsed: Message, flag_bytes: bytes) -> MailMessageView:
+        body_text, body_html, inline_images, attachments = self._extract_bodies_and_metadata(parsed)
         return MailMessageView(
             uid=uid,
             subject=self._decode_header_value(parsed.get("Subject", "(No subject)")),
@@ -309,8 +489,101 @@ class YahooMailService:
             recipients=self._decode_header_value(parsed.get("To", "")),
             received_at=self._safe_date(parsed.get("Date", "")),
             unread=b"\\Seen" not in flag_bytes,
-            body_text=self._extract_body_text(parsed),
+            body_text=body_text,
+            body_html=body_html,
+            inline_images=inline_images,
+            attachments=attachments,
         )
+
+    def _extract_bodies_and_metadata(
+        self,
+        message: Message,
+    ) -> tuple[str, str, list[InlineImageMeta], list[AttachmentMeta]]:
+        plain_parts: list[str] = []
+        html_parts: list[str] = []
+        inline_images: list[InlineImageMeta] = []
+        attachments: list[AttachmentMeta] = []
+        inline_cid_to_data_url: dict[str, str] = {}
+
+        for part in message.walk():
+            if part.is_multipart():
+                continue
+            content_type = part.get_content_type().lower()
+            disposition = (part.get_content_disposition() or "").lower()
+            payload = part.get_payload(decode=True)
+            filename = self._decode_header_value(part.get_filename() or "")
+            size = len(payload) if payload else 0
+            content_id = self._clean_content_id(part.get("Content-ID", ""))
+
+            if content_type == "text/plain" and disposition != "attachment":
+                plain_parts.append(self._decode_text_payload(part, payload))
+                continue
+
+            if content_type == "text/html" and disposition != "attachment":
+                html_parts.append(self._decode_text_payload(part, payload))
+                continue
+
+            if content_type.startswith("image/") and disposition in {"inline", ""} and content_id and payload:
+                data_url = self._to_data_url(content_type, payload)
+                inline_cid_to_data_url[content_id] = data_url
+                inline_images.append(
+                    InlineImageMeta(
+                        content_id=content_id,
+                        content_type=content_type,
+                        filename=filename,
+                        size=size,
+                    )
+                )
+                continue
+
+            if disposition == "attachment" or filename:
+                attachments.append(
+                    AttachmentMeta(
+                        filename=filename or "(unnamed attachment)",
+                        content_type=content_type,
+                        size=size,
+                        disposition=disposition or "attachment",
+                    )
+                )
+
+        body_text = "\n\n".join(self._normalize_text(part) for part in plain_parts if part.strip()).strip()
+        body_html = "\n<hr>\n".join(part.strip() for part in html_parts if part.strip()).strip()
+        if body_html:
+            body_html = self._replace_cid_sources(body_html, inline_cid_to_data_url)
+        elif body_text:
+            body_html = f"<pre>{self._escape_html(body_text)}</pre>"
+
+        if not body_text and body_html:
+            extractor = _HTMLTextExtractor()
+            extractor.feed(body_html)
+            body_text = self._normalize_text(extractor.text())
+
+        return body_text, body_html, inline_images, attachments
+
+    def _decode_text_payload(self, part: Message, payload: bytes | None) -> str:
+        if payload is None:
+            return ""
+        charset = part.get_content_charset() or "utf-8"
+        return payload.decode(charset, errors="replace")
+
+    def _replace_cid_sources(self, html: str, cid_map: dict[str, str]) -> str:
+        def _repl(match: re.Match[str]) -> str:
+            quote = match.group("quote")
+            cid_value = self._clean_content_id(match.group("cid"))
+            replacement = cid_map.get(cid_value)
+            if not replacement:
+                return match.group(0)
+            return f'src={quote}{replacement}{quote}'
+
+        pattern = re.compile(r"src\s*=\s*(?P<quote>['\"])cid:(?P<cid>[^'\"]+)(?P=quote)", re.IGNORECASE)
+        return pattern.sub(_repl, html)
+
+    def _clean_content_id(self, value: str) -> str:
+        return value.strip().strip("<>").strip()
+
+    def _to_data_url(self, content_type: str, payload: bytes) -> str:
+        encoded = base64.b64encode(payload).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
 
     def _build_search_criteria(
         self,
@@ -363,42 +636,6 @@ class YahooMailService:
         if not message_bytes:
             raise YahooMailError("Yahoo returned an empty message payload.")
         return message_bytes, flag_bytes
-
-    def _extract_body_text(self, message: Message) -> str:
-        if message.is_multipart():
-            plain_parts: list[str] = []
-            html_parts: list[str] = []
-            for part in message.walk():
-                if part.get_content_disposition() == "attachment":
-                    continue
-                payload = part.get_payload(decode=True)
-                if payload is None:
-                    continue
-                charset = part.get_content_charset() or "utf-8"
-                content = payload.decode(charset, errors="replace")
-                content_type = part.get_content_type()
-                if content_type == "text/plain":
-                    plain_parts.append(content)
-                elif content_type == "text/html":
-                    html_parts.append(content)
-            if plain_parts:
-                return "\n\n".join(self._normalize_text(part) for part in plain_parts).strip()
-            if html_parts:
-                extractor = _HTMLTextExtractor()
-                for html_part in html_parts:
-                    extractor.feed(html_part)
-                return self._normalize_text(extractor.text())
-            return ""
-        payload = message.get_payload(decode=True)
-        if payload is None:
-            return ""
-        charset = message.get_content_charset() or "utf-8"
-        content = payload.decode(charset, errors="replace")
-        if message.get_content_type() == "text/html":
-            extractor = _HTMLTextExtractor()
-            extractor.feed(content)
-            return self._normalize_text(extractor.text())
-        return self._normalize_text(content)
 
     def _normalize_text(self, text: str) -> str:
         return re.sub(r"\n{3,}", "\n\n", text.replace("\r\n", "\n")).strip()
@@ -477,3 +714,11 @@ class YahooMailService:
                 "Could not connect to Yahoo Mail. Check your internet connection and Yahoo settings, then try again."
             )
         return YahooMailError(message)
+
+    def _escape_html(self, value: str) -> str:
+        return (
+            value.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )

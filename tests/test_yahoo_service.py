@@ -159,6 +159,9 @@ class YahooMailServiceTests(unittest.TestCase):
     def test_read_summarize_and_draft_email(self) -> None:
         message = self.service.read_email("200")
         self.assertIn("Please review", message.body_text)
+        self.assertTrue(message.body_html)
+        self.assertEqual(message.inline_images, [])
+        self.assertEqual(message.attachments, [])
         self.assertEqual(message.sender, "Alice <alice@example.com>")
 
         summary = self.service.summarize_email("200")
@@ -171,6 +174,39 @@ class YahooMailServiceTests(unittest.TestCase):
         new_draft = self.service.draft_new_email("team@example.com", "Hello", "Share the update")
         self.assertEqual(new_draft.body, "Generated draft or summary")
         self.assertEqual(len(self.ai_client.calls), 3)
+
+    def test_html_and_inline_image_rendering(self) -> None:
+        message = EmailMessage()
+        message["From"] = "Example <example@example.com>"
+        message["To"] = "user@yahoo.com"
+        message["Subject"] = "HTML sample"
+        message["Date"] = "Tue, 18 Mar 2025 10:00:00 +0000"
+        message.set_content("Plain body fallback.")
+        message.add_alternative(
+            '<html><body><p>Hello <a href="https://example.com">there</a></p>'
+            '<img src="cid:hero-image"><img src="https://tracker.example.com/pixel.png"></body></html>',
+            subtype="html",
+        )
+        html_part = message.get_payload()[1]
+        html_part.add_related(
+            b"fake image bytes",
+            maintype="image",
+            subtype="png",
+            cid="<hero-image>",
+            disposition="inline",
+            filename="hero.png",
+        )
+
+        view = self.service._build_message_view("999", message, b"")
+        self.assertIn("data:image/png;base64", view.body_html)
+        self.assertEqual(len(view.inline_images), 1)
+
+        blocked = self.service.build_safe_preview_html(view, allow_remote_images=False)
+        self.assertIn("https://example.com", blocked)
+        self.assertNotIn("tracker.example.com", blocked)
+
+        allowed = self.service.build_safe_preview_html(view, allow_remote_images=True)
+        self.assertIn("tracker.example.com", allowed)
 
     def test_send_email_uses_smtp(self) -> None:
         self.service.send_email(
