@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from collections.abc import Callable
 from typing import Any
 
 from app.ai.client import AIClient, AIClientError, AIUnavailableError
@@ -73,18 +74,28 @@ class AssistantService:
         self._yahoo_service = yahoo_service
         self._ai_client = ai_client
 
-    def handle_request(self, request_text: str, context: AssistantContext, settings: AppSettings) -> AssistantResponse:
+    def handle_request(
+        self,
+        request_text: str,
+        context: AssistantContext,
+        settings: AppSettings,
+        on_status: Callable[[str], None] | None = None,
+    ) -> AssistantResponse:
+        emit_status = on_status or (lambda _text: None)
+        emit_status("analyzing request")
         used_context = self._context_labels(context)
         steps: list[_AgentStep] = []
         proposals: list[AssistantActionProposal] = []
 
         for index in range(self._MAX_AGENT_STEPS):
+            emit_status("planning tools")
             model_plan = self._plan_with_ai(request_text, context, settings, steps, index + 1)
             tool_calls = model_plan.get("tool_calls") if isinstance(model_plan.get("tool_calls"), list) else []
             final_answer = str(model_plan.get("final_answer", "")).strip()
 
             if tool_calls:
                 for call in tool_calls:
+                    emit_status("running tool call")
                     execution = self._execute_tool_call(call, context)
                     if execution.get("proposal"):
                         proposals.append(execution["proposal"])
@@ -107,6 +118,7 @@ class AssistantService:
                 continue
 
             if final_answer:
+                emit_status("generating final answer")
                 return AssistantResponse(
                     intent=AssistantIntent.AGENT,
                     answer_text=final_answer,
@@ -144,6 +156,7 @@ class AssistantService:
             "context": {
                 "selected_approved_root": context.selected_root,
                 "current_folder_path": context.open_folder_path,
+                "current_folder_is_root": context.open_folder_path in ("", "."),
                 "selected_file_path": context.selected_file_path,
                 "selected_email_uid": context.selected_email_uid,
                 "selected_email_subject": context.selected_email_subject,
@@ -547,7 +560,12 @@ class AssistantService:
         if context.selected_file_path:
             labels.append(f"selected file {context.selected_file_path}")
         if context.open_folder_path:
-            labels.append(f"open folder {context.open_folder_path}")
+            if context.open_folder_path == ".":
+                labels.append("open folder (approved root)")
+            else:
+                labels.append(f"open folder {context.open_folder_path}")
+        elif context.selected_root:
+            labels.append("open folder (approved root)")
         if context.selected_email_subject:
             labels.append(f"selected email '{context.selected_email_subject}'")
         return labels

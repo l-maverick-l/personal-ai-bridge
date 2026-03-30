@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import traceback
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -10,7 +11,7 @@ class AIWorker(QObject):
     status = Signal(str)
     partial = Signal(str)
     completed = Signal(object)
-    failed = Signal(str)
+    failed = Signal(object)
     finished = Signal()
 
     def __init__(self, task: Callable[[Callable[[str], None], Callable[[str], None], Callable[[], bool]], object]) -> None:
@@ -27,6 +28,12 @@ class AIWorker(QObject):
             result = self._task(self.status.emit, self.partial.emit, self._cancel_event.is_set)
             self.completed.emit(result)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(
+                {
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
         finally:
             self.finished.emit()
