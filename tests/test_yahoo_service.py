@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import sqlite3
+import os
+import tempfile
 import unittest
 from email.message import EmailMessage
 from urllib.request import Request
 
 from app.ai.client import AIClient
 from app.data.action_log import ActionLogger
-from app.data.database import initialize_database
+from app.data.database import connect_database
 from app.data.settings_store import SettingsStore
 from app.email.yahoo_service import OutgoingDraft, YahooMailError, YahooMailService
 from app.models.settings import AppSettings, ProviderConfig
@@ -148,10 +149,11 @@ def fake_remote_opener(request: Request, timeout_seconds: float):
 
 class YahooMailServiceTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.connection = sqlite3.connect(":memory:")
-        self.connection.row_factory = sqlite3.Row
-        initialize_database(self.connection)
-        self.settings_store = SettingsStore(self.connection)
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.temp_db.close()
+        connection = connect_database(self.temp_db.name)
+        connection.close()
+        self.settings_store = SettingsStore(self.temp_db.name)
         self.settings_store.save(
             AppSettings(
                 ai_mode="local",
@@ -161,7 +163,7 @@ class YahooMailServiceTests(unittest.TestCase):
                 setup_complete=True,
             )
         )
-        self.logger = ActionLogger(self.connection)
+        self.logger = ActionLogger(self.temp_db.name)
         self.ai_client = FakeAIClient()
         FakeSMTP.sent_messages = []
         self.service = YahooMailService(
@@ -174,7 +176,7 @@ class YahooMailServiceTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self.connection.close()
+        os.unlink(self.temp_db.name)
 
     def test_connection_and_inbox_listing_work(self) -> None:
         result = self.service.test_connection()

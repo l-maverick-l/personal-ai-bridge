@@ -21,9 +21,16 @@ def get_database_path() -> Path:
     return get_app_data_dir() / DB_FILENAME
 
 
-def connect_database() -> sqlite3.Connection:
-    connection = sqlite3.connect(get_database_path())
+def open_database_connection(database_path: Path | str | None = None) -> sqlite3.Connection:
+    path = Path(database_path) if database_path else get_database_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
+    return connection
+
+
+def connect_database(database_path: Path | str | None = None) -> sqlite3.Connection:
+    connection = open_database_connection(database_path)
     initialize_database(connection)
     return connection
 

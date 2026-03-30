@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from app.ai.client import AIClient
 from app.data.action_log import ActionLogger
-from app.data.database import initialize_database
+from app.data.database import connect_database
 from app.data.settings_store import SettingsStore
 from app.files.folder_registry import AllowedFolderRegistry
 from app.files.service import FileOperationError, FileService
@@ -17,12 +16,13 @@ from app.security.path_guard import PathAccessError, PathGuard
 
 class FileServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.connection = sqlite3.connect(":memory:")
-        self.connection.row_factory = sqlite3.Row
-        initialize_database(self.connection)
-        self.registry = AllowedFolderRegistry(self.connection)
-        self.logger = ActionLogger(self.connection)
-        self.settings_store = SettingsStore(self.connection)
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.temp_db.close()
+        connection = connect_database(self.temp_db.name)
+        connection.close()
+        self.registry = AllowedFolderRegistry(self.temp_db.name)
+        self.logger = ActionLogger(self.temp_db.name)
+        self.settings_store = SettingsStore(self.temp_db.name)
         self.settings_store.save(AppSettings())
         self.service = FileService(
             folder_registry=self.registry,
@@ -36,7 +36,9 @@ class FileServiceTestCase(unittest.TestCase):
         self.registry.add_folder(str(self.root))
 
     def tearDown(self) -> None:
-        self.connection.close()
+        import os
+
+        os.unlink(self.temp_db.name)
         self.tempdir.cleanup()
 
     def test_resolve_relative_path_blocks_traversal(self) -> None:

@@ -1,25 +1,26 @@
 from __future__ import annotations
 
-import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+import tempfile
 import unittest
 
+from app.data.database import connect_database
 from app.data.settings_store import SettingsStore
 from app.models.settings import AppSettings, ProviderConfig
 
 
 class SettingsStoreTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.connection = sqlite3.connect(":memory:")
-        self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(
-            """
-            CREATE TABLE settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            """
-        )
-        self.store = SettingsStore(self.connection)
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.temp_db.close()
+        connection = connect_database(self.temp_db.name)
+        connection.close()
+        self.store = SettingsStore(self.temp_db.name)
+
+    def tearDown(self) -> None:
+        import os
+
+        os.unlink(self.temp_db.name)
 
     def test_load_returns_defaults_when_empty(self) -> None:
         settings = self.store.load()
@@ -58,6 +59,13 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(actual.yahoo_imap_port, expected.yahoo_imap_port)
         self.assertEqual(actual.yahoo_smtp_server, expected.yahoo_smtp_server)
         self.assertTrue(actual.setup_complete)
+
+    def test_store_can_be_used_from_worker_thread(self) -> None:
+        expected = AppSettings(yahoo_email="thread-user@yahoo.com", setup_complete=True)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(self.store.save, expected).result()
+            loaded = executor.submit(self.store.load).result()
+        self.assertEqual(loaded.yahoo_email, expected.yahoo_email)
 
 
 if __name__ == "__main__":

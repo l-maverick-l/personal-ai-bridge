@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from app.assistant.manager import AssistantContext, AssistantIntent, AssistantService
 from app.data.action_log import ActionLogger
-from app.data.database import initialize_database
+from app.data.database import connect_database
 from app.data.settings_store import SettingsStore
 from app.email.yahoo_service import YahooMailService
 from app.files.folder_registry import AllowedFolderRegistry
@@ -29,12 +28,13 @@ class FakeAIClient:
 
 class AssistantServiceTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.connection = sqlite3.connect(":memory:")
-        self.connection.row_factory = sqlite3.Row
-        initialize_database(self.connection)
-        self.registry = AllowedFolderRegistry(self.connection)
-        self.logger = ActionLogger(self.connection)
-        self.store = SettingsStore(self.connection)
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.temp_db.close()
+        connection = connect_database(self.temp_db.name)
+        connection.close()
+        self.registry = AllowedFolderRegistry(self.temp_db.name)
+        self.logger = ActionLogger(self.temp_db.name)
+        self.store = SettingsStore(self.temp_db.name)
         self.store.save(AppSettings())
 
         self.tempdir = tempfile.TemporaryDirectory()
@@ -43,7 +43,9 @@ class AssistantServiceTests(unittest.TestCase):
         self.registry.add_folder(str(self.root))
 
     def tearDown(self) -> None:
-        self.connection.close()
+        import os
+
+        os.unlink(self.temp_db.name)
         self.tempdir.cleanup()
 
     def _assistant_with_ai(self, responses: list[str]) -> AssistantService:

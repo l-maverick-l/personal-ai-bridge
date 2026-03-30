@@ -5,18 +5,20 @@ import sys
 from app.ai.client import AIClient
 from app.core.app_context import AppContext
 from app.data.action_log import ActionLogger, configure_logging
-from app.data.database import connect_database
+from app.data.database import connect_database, get_database_path
 from app.data.settings_store import SettingsStore
 from app.email.yahoo_service import YahooMailService
 from app.files.folder_registry import AllowedFolderRegistry
 from app.files.service import FileService
 
 
-def build_context() -> tuple[AppContext, object]:
-    connection = connect_database()
-    settings_store = SettingsStore(connection)
-    action_logger = ActionLogger(connection)
-    folder_registry = AllowedFolderRegistry(connection)
+def build_context() -> AppContext:
+    database_path = get_database_path()
+    connection = connect_database(database_path)
+    connection.close()
+    settings_store = SettingsStore(database_path)
+    action_logger = ActionLogger(database_path)
+    folder_registry = AllowedFolderRegistry(database_path)
     ai_client = AIClient()
     yahoo_mail_service = YahooMailService(
         settings_store=settings_store,
@@ -36,7 +38,7 @@ def build_context() -> tuple[AppContext, object]:
         ai_client=ai_client,
         yahoo_mail_service=yahoo_mail_service,
     )
-    return context, connection
+    return context
 
 
 def main() -> int:
@@ -46,12 +48,10 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     logger = configure_logging()
-    context, connection = build_context()
+    context = build_context()
     window = MainWindow(context, logger)
     window.show()
-    exit_code = app.exec()
-    connection.close()
-    return exit_code
+    return app.exec()
 
 
 if __name__ == "__main__":

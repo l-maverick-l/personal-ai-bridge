@@ -1,30 +1,27 @@
 from __future__ import annotations
 
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+from app.data.database import connect_database
 from app.files.folder_registry import AllowedFolderRegistry
 from app.security.path_guard import PathAccessError, PathGuard
 
 
 class FolderRegistryTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.connection = sqlite3.connect(":memory:")
-        self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(
-            """
-            CREATE TABLE allowed_roots (
-                path TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        self.registry = AllowedFolderRegistry(self.connection)
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.temp_db.close()
+        connection = connect_database(self.temp_db.name)
+        connection.close()
+        self.registry = AllowedFolderRegistry(self.temp_db.name)
         self.temp_dir = tempfile.TemporaryDirectory()
 
     def tearDown(self) -> None:
+        import os
+
+        os.unlink(self.temp_db.name)
         self.temp_dir.cleanup()
 
     def test_add_and_list_folder(self) -> None:
