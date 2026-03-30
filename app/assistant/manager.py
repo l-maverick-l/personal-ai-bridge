@@ -38,6 +38,7 @@ class AssistantActionProposal:
 class AssistantResponse:
     intent: AssistantIntent
     answer_text: str
+    executed_actions: list[str] = field(default_factory=list)
     proposed_actions: list[AssistantActionProposal] = field(default_factory=list)
     used_context: list[str] = field(default_factory=list)
 
@@ -52,6 +53,9 @@ class _AgentStep:
 class AssistantService:
     _MAX_AGENT_STEPS = 4
     _SAFE_TOOLS: tuple[str, ...] = (
+        "list_approved_roots",
+        "add_approved_root",
+        "remove_approved_root",
         "list_directory",
         "search_files",
         "read_file",
@@ -93,6 +97,7 @@ class AssistantService:
         used_context = self._context_labels(context)
         steps: list[_AgentStep] = []
         proposals: list[AssistantActionProposal] = []
+        executed_actions: list[str] = []
 
         for index in range(self._MAX_AGENT_STEPS):
             emit_status("planning tools")
@@ -103,9 +108,11 @@ class AssistantService:
             if tool_calls:
                 for call in tool_calls:
                     emit_status("running tool call")
-                    execution = self._execute_tool_call(call, context)
+                    execution = self._execute_tool_call(call, context, settings)
                     if execution.get("proposal"):
                         proposals.append(execution["proposal"])
+                    if execution.get("ok") and execution.get("executed_action"):
+                        executed_actions.append(str(execution["executed_action"]))
                     serializable_result = dict(execution)
                     if "proposal" in serializable_result:
                         proposal = serializable_result.pop("proposal")
@@ -129,6 +136,7 @@ class AssistantService:
                 return AssistantResponse(
                     intent=AssistantIntent.AGENT,
                     answer_text=final_answer,
+                    executed_actions=executed_actions,
                     proposed_actions=proposals,
                     used_context=used_context,
                 )
@@ -136,6 +144,7 @@ class AssistantService:
             return AssistantResponse(
                 intent=AssistantIntent.AGENT,
                 answer_text="I could not complete this request because the AI response was missing both tool calls and a final answer.",
+                executed_actions=executed_actions,
                 proposed_actions=proposals,
                 used_context=used_context,
             )
@@ -146,6 +155,7 @@ class AssistantService:
                 "I stopped after several tool steps to stay safe. Please retry with a narrower request, "
                 "or run the action manually in the Files or Yahoo Mail tabs."
             ),
+            executed_actions=executed_actions,
             proposed_actions=proposals,
             used_context=used_context,
         )
@@ -168,6 +178,7 @@ class AssistantService:
                 "selected_email_uid": context.selected_email_uid,
                 "selected_email_subject": context.selected_email_subject,
                 "available_tools": list(self._SAFE_TOOLS),
+                "execution_policy": settings.execution_policy,
             },
             "step_number": step_number,
             "prior_tool_results": [
@@ -322,7 +333,7 @@ class AssistantService:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    def _execute_tool_call(self, tool_call: Any, context: AssistantContext) -> dict[str, Any]:
+    def _execute_tool_call(self, tool_call: Any, context: AssistantContext, settings: AppSettings) -> dict[str, Any]:
         if not isinstance(tool_call, dict):
             return {"ok": False, "error": "Tool call must be an object.", "tool_name": "unknown", "args": {}}
         tool_name = str(tool_call.get("name", "")).strip()
@@ -341,6 +352,7 @@ class AssistantService:
                     "ok": True,
                     "tool_name": tool_name,
                     "args": args,
+                    "executed_action": f"Listed folder {root}:{listing.relative_path or '.'}",
                     "result": {
                         "root": listing.root,
                         "relative_path": listing.relative_path,
@@ -358,6 +370,7 @@ class AssistantService:
                     "ok": True,
                     "tool_name": tool_name,
                     "args": args,
+                    "executed_action": f"Searched files for '{query}' in {root}",
                     "result": {
                         "query": query,
                         "count": len(matches),
@@ -372,6 +385,7 @@ class AssistantService:
                     "ok": True,
                     "tool_name": tool_name,
                     "args": args,
+                    "executed_action": f"Read file {root}:{relative_path}",
                     "result": {"relative_path": data.relative_path, "content": data.content[:12000]},
                 }
             if tool_name == "summarize_file":
@@ -382,27 +396,105 @@ class AssistantService:
                     "ok": True,
                     "tool_name": tool_name,
                     "args": args,
+                    "executed_action": f"Summarized file {root}:{relative_path}",
                     "result": {"relative_path": relative_path, "summary": summary},
+                }
+            if tool_name == "list_approved_roots":
+                roots = self._file_service.list_allowed_roots()
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "executed_action": "Listed approved roots",
+                    "result": {"roots": roots},
+                }
+            if tool_name == "add_approved_root":
+                folder_path = str(args.get("folder_path") or args.get("root") or "").strip()
+                if not folder_path:
+                    raise ValueError("Missing required folder path for add_approved_root.")
+                if not self._can_auto_execute(tool_name, settings=settings):
+                    return self._proposal_result(
+                        tool_name,
+                        args,
+                        AssistantActionProposal(
+                            action_type="approved_root_add",
+                            title=f"Add approved root {folder_path}",
+                            parameters={"root": folder_path},
+                            requires_confirmation=True,
+                        ),
+                    )
+                normalized = self._file_service.add_allowed_root(folder_path)
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "executed_action": f"Added approved root {normalized}",
+                    "result": {"root": normalized},
+                }
+            if tool_name == "remove_approved_root":
+                folder_path = str(args.get("folder_path") or args.get("root") or "").strip()
+                if not folder_path:
+                    raise ValueError("Missing required folder path for remove_approved_root.")
+                if not self._can_auto_execute(tool_name, settings=settings):
+                    return self._proposal_result(
+                        tool_name,
+                        args,
+                        AssistantActionProposal(
+                            action_type="approved_root_remove",
+                            title=f"Remove approved root {folder_path}",
+                            parameters={"root": folder_path},
+                            requires_confirmation=True,
+                        ),
+                    )
+                normalized = self._file_service.remove_allowed_root(folder_path)
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "executed_action": f"Removed approved root {normalized}",
+                    "result": {"root": normalized},
                 }
             if tool_name == "create_file":
                 root = self._required_root(context, args)
                 relative_path = str(args.get("relative_path", "")).strip()
                 content = str(args.get("content", ""))
+                if not self._can_auto_execute(tool_name, settings=settings):
+                    return self._proposal_result(
+                        tool_name,
+                        args,
+                        AssistantActionProposal(
+                            action_type="file_create",
+                            title=f"Create file {relative_path}",
+                            parameters={"root": root, "relative_path": relative_path, "content": content},
+                            requires_confirmation=True,
+                        ),
+                    )
                 created_path = self._file_service.create_file(root, relative_path, content)
-                return {"ok": True, "tool_name": tool_name, "args": args, "result": {"created_path": created_path}}
+                return {"ok": True, "tool_name": tool_name, "args": args, "executed_action": f"Created file {root}:{relative_path}", "result": {"created_path": created_path}}
             if tool_name == "rename_file":
                 root = self._required_root(context, args)
                 relative_path = self._required_relative_path(context, args, "relative_path", "selected_file_path")
                 new_name = str(args.get("new_name", "")).strip()
+                if not self._can_auto_execute(tool_name, settings=settings):
+                    return self._proposal_result(
+                        tool_name,
+                        args,
+                        AssistantActionProposal(
+                            action_type="file_rename",
+                            title=f"Rename {relative_path} to {new_name}",
+                            parameters={"root": root, "relative_path": relative_path, "new_name": new_name},
+                            requires_confirmation=True,
+                        ),
+                    )
                 renamed_path = self._file_service.rename_file(root, relative_path, new_name)
-                return {"ok": True, "tool_name": tool_name, "args": args, "result": {"renamed_path": renamed_path}}
+                return {"ok": True, "tool_name": tool_name, "args": args, "executed_action": f"Renamed {root}:{relative_path} to {new_name}", "result": {"renamed_path": renamed_path}}
             if tool_name == "copy_file":
                 source_root = str(args.get("source_root") or context.selected_root).strip()
                 source_relative = self._required_relative_path(context, args, "source_relative_path", "selected_file_path")
                 destination_root = str(args.get("destination_root") or source_root).strip()
                 destination_relative = str(args.get("destination_relative_path", "")).strip()
                 overwrite = bool(args.get("overwrite", False))
-                if overwrite:
+                if overwrite or not self._can_auto_execute(tool_name, settings=settings):
                     return {
                         "ok": True,
                         "tool_name": tool_name,
@@ -422,12 +514,21 @@ class AssistantService:
                         "result": {"status": "confirmation_required"},
                     }
                 copied_path = self._file_service.copy_file(source_root, source_relative, destination_root, destination_relative, overwrite=False)
-                return {"ok": True, "tool_name": tool_name, "args": args, "result": {"copied_path": copied_path}}
+                return {"ok": True, "tool_name": tool_name, "args": args, "executed_action": f"Copied {source_root}:{source_relative} to {destination_root}:{destination_relative}", "result": {"copied_path": copied_path}}
             if tool_name == "move_file":
                 source_root = str(args.get("source_root") or context.selected_root).strip()
                 source_relative = self._required_relative_path(context, args, "source_relative_path", "selected_file_path")
                 destination_root = str(args.get("destination_root") or source_root).strip()
                 destination_relative = str(args.get("destination_relative_path", "")).strip()
+                if self._can_auto_execute(tool_name, settings=settings):
+                    moved_path = self._file_service.move_file(source_root, source_relative, destination_root, destination_relative, overwrite=False)
+                    return {
+                        "ok": True,
+                        "tool_name": tool_name,
+                        "args": args,
+                        "executed_action": f"Moved {source_root}:{source_relative} to {destination_root}:{destination_relative}",
+                        "result": {"moved_path": moved_path},
+                    }
                 proposal = AssistantActionProposal(
                     action_type="file_move",
                     title=f"Move file to {destination_relative}",
@@ -482,6 +583,7 @@ class AssistantService:
                     "ok": True,
                     "tool_name": tool_name,
                     "args": args,
+                    "executed_action": "Listed inbox messages",
                     "result": {
                         "count": len(messages),
                         "emails": [
@@ -503,6 +605,7 @@ class AssistantService:
                     "ok": True,
                     "tool_name": tool_name,
                     "args": args,
+                    "executed_action": f"Read email {uid}",
                     "result": {
                         "uid": message.uid,
                         "subject": message.subject,
@@ -514,7 +617,7 @@ class AssistantService:
             if tool_name == "summarize_email":
                 uid = str(args.get("uid") or context.selected_email_uid).strip()
                 summary = self._yahoo_service.summarize_email(uid)
-                return {"ok": True, "tool_name": tool_name, "args": args, "result": {"uid": uid, "summary": summary}}
+                return {"ok": True, "tool_name": tool_name, "args": args, "executed_action": f"Summarized email {uid}", "result": {"uid": uid, "summary": summary}}
             if tool_name == "draft_reply":
                 uid = str(args.get("uid") or context.selected_email_uid).strip()
                 notes = str(args.get("notes", ""))
@@ -530,6 +633,7 @@ class AssistantService:
                     "tool_name": tool_name,
                     "args": args,
                     "proposal": proposal,
+                    "executed_action": f"Drafted a reply for email {uid}",
                     "result": {"status": "draft_ready", "to": draft.to_address, "subject": draft.subject},
                 }
             if tool_name == "draft_new_email":
@@ -548,6 +652,7 @@ class AssistantService:
                     "tool_name": tool_name,
                     "args": args,
                     "proposal": proposal,
+                    "executed_action": f"Drafted a new email to {to_address}",
                     "result": {"status": "draft_ready", "to": draft.to_address, "subject": draft.subject},
                 }
             if tool_name == "send_email":
@@ -555,6 +660,15 @@ class AssistantService:
                 subject = str(args.get("subject", "")).strip()
                 body = str(args.get("body", "")).strip()
                 use_current = bool(args.get("use_current_draft", False))
+                if self._can_auto_execute(tool_name, settings=settings) and not use_current:
+                    self._yahoo_service.send_email(OutgoingDraft(to_address=to_address, subject=subject, body=body))
+                    return {
+                        "ok": True,
+                        "tool_name": tool_name,
+                        "args": args,
+                        "executed_action": f"Sent email to {to_address}",
+                        "result": {"status": "sent"},
+                    }
                 parameters = {"use_current_draft": "true"} if use_current else {
                     "to": to_address,
                     "subject": subject,
@@ -577,6 +691,32 @@ class AssistantService:
             return {"ok": False, "tool_name": tool_name, "args": args, "error": str(exc)}
 
         return {"ok": False, "tool_name": tool_name, "args": args, "error": f"Unhandled tool: {tool_name}"}
+
+    def _can_auto_execute(self, tool_name: str, settings: AppSettings | None) -> bool:
+        policy = (settings.execution_policy if settings else "confirm_destructive_external").strip()
+        if tool_name in {"list_approved_roots", "list_directory", "search_files", "read_file", "summarize_file", "list_inbox", "read_email", "summarize_email", "draft_reply", "draft_new_email"}:
+            return True
+        if tool_name in {"create_file", "rename_file", "copy_file", "move_file"}:
+            return policy in {"trusted_roots_auto", "full_auto"}
+        if tool_name in {"delete_file", "send_email"}:
+            return policy == "full_auto"
+        if tool_name in {"add_approved_root", "remove_approved_root"}:
+            return policy in {"trusted_roots_auto", "full_auto"}
+        return False
+
+    def _proposal_result(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        proposal: AssistantActionProposal,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "args": args,
+            "proposal": proposal,
+            "result": {"status": "confirmation_required"},
+        }
 
     def _required_root(self, context: AssistantContext, args: dict[str, Any]) -> str:
         root = str(args.get("root") or context.selected_root).strip()

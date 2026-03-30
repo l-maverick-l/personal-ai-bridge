@@ -135,6 +135,17 @@ class MainWindow(QMainWindow):
 
         quick_actions = QGroupBox("Quick actions")
         quick_layout = QVBoxLayout(quick_actions)
+        policy_form = QFormLayout()
+        self.execution_policy_selector = QComboBox()
+        self.execution_policy_selector.addItem("Read-only auto-execute", "read_only_auto")
+        self.execution_policy_selector.addItem("Trusted approved-roots auto-execute", "trusted_roots_auto")
+        self.execution_policy_selector.addItem("Confirm destructive/external only", "confirm_destructive_external")
+        self.execution_policy_selector.addItem("Full auto-execute (advanced)", "full_auto")
+        save_policy_button = QPushButton("Save execution policy")
+        save_policy_button.clicked.connect(self.save_execution_policy)
+        policy_form.addRow("Execution policy", self.execution_policy_selector)
+        quick_layout.addLayout(policy_form)
+        quick_layout.addWidget(save_policy_button)
         setup_button = QPushButton("Run setup wizard")
         setup_button.clicked.connect(self.run_setup_wizard)
         refresh_files_button = QPushButton("Refresh file view")
@@ -509,6 +520,7 @@ class MainWindow(QMainWindow):
         provider_label = self._settings.provider.label or "Not configured"
         model_name = self._settings.provider.model_name or "No model selected"
         self.provider_status_label.setText(f"Provider/model: {provider_label} / {model_name}")
+        self._restore_combo_value(self.execution_policy_selector, self._settings.execution_policy, role=Qt.ItemDataRole.UserRole)
 
         self.yahoo_email_input.setText(self._settings.yahoo_email)
         self.yahoo_password_input.setText(self._settings.yahoo_app_password)
@@ -1074,10 +1086,13 @@ class MainWindow(QMainWindow):
             return ""
         return root
 
-    def _restore_combo_value(self, combo: QComboBox, value: str) -> None:
+    def _restore_combo_value(self, combo: QComboBox, value: str, role: Qt.ItemDataRole = Qt.ItemDataRole.DisplayRole) -> None:
         if not value:
             return
-        index = combo.findText(value)
+        if role == Qt.ItemDataRole.DisplayRole:
+            index = combo.findText(value)
+        else:
+            index = combo.findData(value, role)
         if index >= 0:
             combo.setCurrentIndex(index)
 
@@ -1250,7 +1265,8 @@ class MainWindow(QMainWindow):
     def _assistant_request_succeeded(self, response) -> None:
         self.assistant_status_label.setText("Assistant status: ready")
         used_context = f"Used context: {', '.join(response.used_context)}" if response.used_context else "Used context: none"
-        body = f"{response.answer_text}\n\n{used_context}"
+        executed = "Executed actions:\n- " + "\n- ".join(response.executed_actions) if response.executed_actions else "Executed actions: none"
+        body = f"{response.answer_text}\n\n{executed}\n\n{used_context}"
         self._append_assistant_entry("Assistant", body)
         self.assistant_input.clear()
 
@@ -1320,6 +1336,46 @@ class MainWindow(QMainWindow):
             self._show_error("Could not queue assistant action", exc)
 
     def _queue_assistant_action(self, proposal: AssistantActionProposal) -> None:
+        if proposal.action_type == "approved_root_add":
+            root = proposal.parameters.get("root", "")
+            self._set_pending_action(
+                message=f"Assistant requested adding an approved root. Confirm to allow:\n\n{root}",
+                action=lambda: self._show_result(f"Assistant added approved root: {self._context.file_service.add_allowed_root(root)}"),
+            )
+            return
+
+        if proposal.action_type == "approved_root_remove":
+            root = proposal.parameters.get("root", "")
+            self._set_pending_action(
+                message=f"Assistant requested removing an approved root. Confirm:\n\n{root}",
+                action=lambda: self._show_result(f"Assistant removed approved root: {self._context.file_service.remove_allowed_root(root)}"),
+            )
+            return
+
+        if proposal.action_type == "file_create":
+            root = proposal.parameters.get("root", "")
+            relative_path = proposal.parameters.get("relative_path", "")
+            content = proposal.parameters.get("content", "")
+            self._set_pending_action(
+                message=f"Assistant requested creating a file. Confirm:\n\n{root}:{relative_path}",
+                action=lambda: self._show_result(
+                    f"Assistant create completed: {self._context.file_service.create_file(root, relative_path, content)}"
+                ),
+            )
+            return
+
+        if proposal.action_type == "file_rename":
+            root = proposal.parameters.get("root", "")
+            relative_path = proposal.parameters.get("relative_path", "")
+            new_name = proposal.parameters.get("new_name", "")
+            self._set_pending_action(
+                message=f"Assistant requested renaming a file. Confirm:\n\n{root}:{relative_path} -> {new_name}",
+                action=lambda: self._show_result(
+                    f"Assistant rename completed: {self._context.file_service.rename_file(root, relative_path, new_name)}"
+                ),
+            )
+            return
+
         if proposal.action_type == "email_use_draft":
             draft = OutgoingDraft(
                 to_address=proposal.parameters.get("to", ""),
@@ -1398,6 +1454,12 @@ class MainWindow(QMainWindow):
     def _execute_assistant_copy(self, src_root: str, src_rel: str, dst_root: str, dst_rel: str, overwrite: bool) -> None:
         destination = self._context.file_service.copy_file(src_root, src_rel, dst_root, dst_rel, overwrite=overwrite)
         self._show_result(f"Assistant copy completed: {destination}")
+
+    def save_execution_policy(self) -> None:
+        policy = self.execution_policy_selector.currentData(Qt.ItemDataRole.UserRole) or "confirm_destructive_external"
+        self._settings.execution_policy = str(policy)
+        self._context.settings_store.save(self._settings)
+        self._show_result(f"Saved execution policy: {policy}")
 
     def test_ai_provider(self) -> None:
         result = self._context.ai_client.test_provider(self._settings)

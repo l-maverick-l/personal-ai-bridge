@@ -277,6 +277,7 @@ class SetupWizard(QWizard):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._initial_execution_policy = settings.execution_policy or "confirm_destructive_external"
         self.setWindowTitle("Personal AI Bridge Setup")
         self.setWizardStyle(QWizard.ModernStyle)
         self.resize(760, 560)
@@ -318,6 +319,7 @@ class SetupWizard(QWizard):
             yahoo_smtp_port=self.yahoo_page.smtp_port_edit.value(),
             ai_local_timeout_seconds=self.provider_page.local_timeout_edit.value(),
             ai_cloud_timeout_seconds=self.provider_page.cloud_timeout_edit.value(),
+            execution_policy=self._initial_execution_policy,
             setup_complete=True,
         )
 
