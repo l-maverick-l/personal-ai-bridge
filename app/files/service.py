@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import subprocess
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +17,7 @@ from app.data.settings_store import SettingsStore
 from app.files.folder_registry import AllowedFolderRegistry
 from app.security.path_guard import PathAccessError, PathGuard
 
-SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".docx", ".pdf"}
+SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".doc", ".docx", ".pdf"}
 CREATABLE_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json"}
 
 
@@ -323,6 +326,8 @@ class FileService:
                 raise FileOperationError("DOCX reading requires python-docx to be installed.") from exc
             document = Document(file_path)
             return "\n".join(paragraph.text for paragraph in document.paragraphs)
+        if suffix == ".doc":
+            return self._read_doc_file(file_path)
         if suffix == ".pdf":
             try:
                 from pypdf import PdfReader
@@ -331,6 +336,103 @@ class FileService:
             reader = PdfReader(str(file_path))
             return "\n\n".join(page.extract_text() or "" for page in reader.pages).strip()
         raise UnsupportedFileTypeError(f"Unsupported file type: {suffix}")
+
+    def _read_doc_file(self, file_path: Path) -> str:
+        attempts: list[str] = []
+        available_methods: list[str] = []
+
+        if os.name == "nt":
+            available_methods.append("Microsoft Word")
+            try:
+                return self._read_doc_with_word_com(file_path)
+            except Exception as exc:  # pragma: no cover - platform/dependency dependent
+                attempts.append(f"Microsoft Word automation failed: {exc}")
+
+        available_methods.append("LibreOffice")
+        try:
+            return self._read_doc_with_libreoffice(file_path)
+        except Exception as exc:
+            attempts.append(f"LibreOffice conversion failed: {exc}")
+
+        available_methods.append("antiword")
+        try:
+            return self._read_doc_with_antiword(file_path)
+        except Exception as exc:
+            attempts.append(f"antiword extraction failed: {exc}")
+
+        methods = ", ".join(available_methods)
+        attempt_summary = " | ".join(attempts)
+        raise FileOperationError(
+            "Could not read this legacy .doc file. Install at least one supported extractor "
+            f"({methods}) and try again. Details: {attempt_summary}"
+        )
+
+    def _read_doc_with_word_com(self, file_path: Path) -> str:
+        try:
+            import win32com.client  # type: ignore[import-untyped]
+        except ModuleNotFoundError as exc:
+            raise FileOperationError("pywin32 is not installed for Word automation.") from exc
+
+        word = None
+        document = None
+        try:
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = False
+            document = word.Documents.Open(str(file_path), ReadOnly=True)
+            text = document.Content.Text or ""
+            text = text.strip()
+            if not text:
+                raise FileOperationError("Word opened the file, but no readable text was extracted.")
+            return text
+        finally:  # pragma: no cover - platform/dependency dependent
+            if document is not None:
+                document.Close(False)
+            if word is not None:
+                word.Quit()
+
+    def _read_doc_with_libreoffice(self, file_path: Path) -> str:
+        executable = shutil.which("soffice") or shutil.which("libreoffice")
+        if not executable:
+            raise FileOperationError("LibreOffice command (soffice/libreoffice) was not found.")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subprocess.run(
+                [
+                    executable,
+                    "--headless",
+                    "--convert-to",
+                    "txt:Text",
+                    "--outdir",
+                    temp_dir,
+                    str(file_path),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            output_path = Path(temp_dir) / f"{file_path.stem}.txt"
+            if not output_path.exists():
+                raise FileOperationError("LibreOffice did not produce a text output file.")
+            text = output_path.read_text(encoding="utf-8", errors="replace").strip()
+            if not text:
+                raise FileOperationError("LibreOffice conversion completed, but extracted text was empty.")
+            return text
+
+    def _read_doc_with_antiword(self, file_path: Path) -> str:
+        executable = shutil.which("antiword")
+        if not executable:
+            raise FileOperationError("antiword command was not found.")
+        result = subprocess.run(
+            [executable, str(file_path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        text = (result.stdout or "").strip()
+        if not text:
+            raise FileOperationError("antiword ran, but extracted text was empty.")
+        return text
 
     def _to_relative(self, root_path: Path, candidate: Path) -> str:
         if candidate == root_path:
