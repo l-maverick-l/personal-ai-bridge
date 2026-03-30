@@ -39,6 +39,8 @@ class AppSettings:
     yahoo_imap_port: int = 993
     yahoo_smtp_server: str = "smtp.mail.yahoo.com"
     yahoo_smtp_port: int = 465
+    ai_local_timeout_seconds: int = 180
+    ai_cloud_timeout_seconds: int = 45
     setup_complete: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -58,6 +60,8 @@ class AppSettings:
             yahoo_imap_port=int(payload.get("yahoo_imap_port", 993) or 993),
             yahoo_smtp_server=payload.get("yahoo_smtp_server", "smtp.mail.yahoo.com"),
             yahoo_smtp_port=int(payload.get("yahoo_smtp_port", 465) or 465),
+            ai_local_timeout_seconds=int(payload.get("ai_local_timeout_seconds", 180) or 180),
+            ai_cloud_timeout_seconds=int(payload.get("ai_cloud_timeout_seconds", 45) or 45),
             setup_complete=bool(payload.get("setup_complete", False)),
         )
 

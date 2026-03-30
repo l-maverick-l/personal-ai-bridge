@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import socket
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib import error, request
 
 from app.models.settings import AppSettings
@@ -16,9 +18,23 @@ class AIUnavailableError(AIClientError):
     """Raised when AI is not configured or not reachable."""
 
 
+class AITimeoutError(AIClientError):
+    """Raised when the provider did not respond in time."""
+
+
+@dataclass(slots=True)
+class AIProviderTestResult:
+    provider: str
+    model: str
+    success: bool
+    elapsed_seconds: float
+    message: str
+
+
 @dataclass(slots=True)
 class AIClient:
-    timeout_seconds: int = 30
+    default_local_timeout_seconds: int = 180
+    default_cloud_timeout_seconds: int = 45
 
     def is_available(self, settings: AppSettings) -> bool:
         provider = settings.provider
@@ -29,26 +45,54 @@ class AIClient:
             and bool(provider.model_name.strip())
         )
 
-    def summarize_text(self, text: str, settings: AppSettings) -> str:
+    def summarize_text(
+        self,
+        text: str,
+        settings: AppSettings,
+        on_status: Callable[[str], None] | None = None,
+        on_partial: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> str:
+        compact_text = self._compact_for_local_model(text, settings)
         prompt = (
             "Summarize the following file for a non-technical user. "
             "Use short bullets and keep important names, dates, and action items.\n\n"
-            f"File content:\n{text[:12000]}"
+            f"File content:\n{compact_text}"
         )
         return self.generate_text(
             settings,
             system_prompt="You summarize user files clearly and briefly.",
             user_prompt=prompt,
+            on_status=on_status,
+            on_partial=on_partial,
+            is_cancelled=is_cancelled,
         )
 
-    def generate_text(self, settings: AppSettings, system_prompt: str, user_prompt: str) -> str:
+    def generate_text(
+        self,
+        settings: AppSettings,
+        system_prompt: str,
+        user_prompt: str,
+        on_status: Callable[[str], None] | None = None,
+        on_partial: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> str:
         if not self.is_available(settings):
             raise AIUnavailableError(
                 "AI features are not available because no provider and model are configured."
             )
         provider = settings.provider
+        request_timeout = self._timeout_for_settings(settings)
         if provider.provider_type == "ollama":
-            return self._call_ollama(provider.base_url, provider.model_name, user_prompt)
+            return self._call_ollama(
+                provider.base_url,
+                provider.model_name,
+                user_prompt,
+                request_timeout,
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
+            )
         if provider.provider_type in {"openai_local", "openai_cloud"}:
             return self._call_openai_compatible(
                 provider.base_url,
@@ -56,18 +100,77 @@ class AIClient:
                 provider.api_key,
                 system_prompt,
                 user_prompt,
+                request_timeout,
+                on_status=on_status,
             )
         raise AIUnavailableError(f"Unsupported AI provider type: {provider.provider_type}")
 
-    def _call_ollama(self, base_url: str, model_name: str, prompt: str) -> str:
+    def test_provider(self, settings: AppSettings) -> AIProviderTestResult:
+        start = time.monotonic()
+        provider = settings.provider
+        try:
+            self.generate_text(
+                settings=settings,
+                system_prompt="You are a concise assistant.",
+                user_prompt="Reply with exactly: OK",
+            )
+            elapsed = time.monotonic() - start
+            return AIProviderTestResult(
+                provider=provider.label,
+                model=provider.model_name,
+                success=True,
+                elapsed_seconds=elapsed,
+                message="Provider test succeeded.",
+            )
+        except AIClientError as exc:
+            elapsed = time.monotonic() - start
+            return AIProviderTestResult(
+                provider=provider.label,
+                model=provider.model_name,
+                success=False,
+                elapsed_seconds=elapsed,
+                message=str(exc),
+            )
+
+    def _call_ollama(
+        self,
+        base_url: str,
+        model_name: str,
+        prompt: str,
+        request_timeout: int,
+        on_status: Callable[[str], None] | None = None,
+        on_partial: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> str:
         payload = {
             "model": model_name,
             "prompt": prompt,
-            "stream": False,
+            "stream": True,
         }
-        response = self._post_json(f"{base_url.rstrip('/')}/api/generate", payload)
-        summary = response.get("response", "").strip()
+        if on_status:
+            on_status("Connecting to AI provider")
+        response_chunks = self._stream_json_lines(
+            f"{base_url.rstrip('/')}/api/generate",
+            payload,
+            timeout_seconds=request_timeout,
+            on_status=on_status,
+            is_cancelled=is_cancelled,
+        )
+        chunks: list[str] = []
+        saw_activity = False
+        for item in response_chunks:
+            saw_activity = True
+            piece = str(item.get("response", ""))
+            if piece:
+                chunks.append(piece)
+                if on_partial:
+                    on_partial("".join(chunks))
+        summary = "".join(chunks).strip()
         if not summary:
+            if saw_activity:
+                raise AIClientError(
+                    "The local model was active but did not return usable text. Try a different model."
+                )
             raise AIClientError("The AI provider returned an empty response.")
         return summary
 
@@ -78,6 +181,8 @@ class AIClient:
         api_key: str,
         system_prompt: str,
         user_prompt: str,
+        request_timeout: int,
+        on_status: Callable[[str], None] | None = None,
     ) -> str:
         payload = {
             "model": model_name,
@@ -90,9 +195,12 @@ class AIClient:
         headers: dict[str, str] = {}
         if api_key.strip():
             headers["Authorization"] = f"Bearer {api_key.strip()}"
+        if on_status:
+            on_status("Generating response")
         response = self._post_json(
             f"{base_url.rstrip('/')}/chat/completions",
             payload,
+            timeout_seconds=request_timeout,
             headers=headers,
         )
         choices = response.get("choices") or []
@@ -108,6 +216,7 @@ class AIClient:
         self,
         url: str,
         payload: dict[str, Any],
+        timeout_seconds: int,
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         request_headers = {
@@ -117,10 +226,97 @@ class AIClient:
         body = json.dumps(payload).encode("utf-8")
         http_request = request.Request(url, data=body, headers=request_headers, method="POST")
         try:
-            with request.urlopen(http_request, timeout=self.timeout_seconds) as response:
+            with request.urlopen(http_request, timeout=timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
+        except TimeoutError as exc:
+            raise AITimeoutError(
+                "The AI provider timed out before completing the request."
+            ) from exc
+        except socket.timeout as exc:
+            raise AITimeoutError(
+                "The AI provider timed out before completing the request."
+            ) from exc
         except error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
+            lowered = details.lower()
+            if exc.code == 404 or "model" in lowered and "not found" in lowered:
+                raise AIClientError(
+                    "The configured model was not found on the AI provider. Check the model name."
+                ) from exc
             raise AIClientError(f"AI provider HTTP error {exc.code}: {details}") from exc
         except error.URLError as exc:
             raise AIUnavailableError(f"Could not reach the AI provider: {exc.reason}") from exc
+
+    def _stream_json_lines(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        timeout_seconds: int,
+        on_status: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        request_headers = {"Content-Type": "application/json"}
+        body = json.dumps(payload).encode("utf-8")
+        http_request = request.Request(url, data=body, headers=request_headers, method="POST")
+        parsed: list[dict[str, Any]] = []
+        saw_tokens = False
+        try:
+            with request.urlopen(http_request, timeout=timeout_seconds) as response:
+                if on_status:
+                    on_status("Waiting for model")
+                for raw_line in response:
+                    if is_cancelled and is_cancelled():
+                        raise AIClientError("Request cancelled.")
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    chunk = json.loads(line)
+                    parsed.append(chunk)
+                    if chunk.get("response"):
+                        if not saw_tokens and on_status:
+                            on_status("Generating response")
+                        saw_tokens = True
+        except TimeoutError as exc:
+            if saw_tokens:
+                raise AITimeoutError(
+                    "The local model was still generating, but no new output arrived before timeout."
+                ) from exc
+            raise AITimeoutError(
+                "The AI provider did not respond before timeout. Local models may need a higher timeout."
+            ) from exc
+        except socket.timeout as exc:
+            if saw_tokens:
+                raise AITimeoutError(
+                    "The local model was still generating, but no new output arrived before timeout."
+                ) from exc
+            raise AITimeoutError(
+                "The AI provider did not respond before timeout. Local models may need a higher timeout."
+            ) from exc
+        except error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            lowered = details.lower()
+            if exc.code == 404 or "model" in lowered and "not found" in lowered:
+                raise AIClientError(
+                    "The configured model was not found on the AI provider. Check the model name."
+                ) from exc
+            raise AIClientError(f"AI provider HTTP error {exc.code}: {details}") from exc
+        except error.URLError as exc:
+            raise AIUnavailableError(f"Could not reach the AI provider: {exc.reason}") from exc
+        return parsed
+
+    def _timeout_for_settings(self, settings: AppSettings) -> int:
+        provider_type = settings.provider.provider_type
+        if provider_type in {"ollama", "openai_local"}:
+            return max(10, int(settings.ai_local_timeout_seconds or self.default_local_timeout_seconds))
+        return max(10, int(settings.ai_cloud_timeout_seconds or self.default_cloud_timeout_seconds))
+
+    def _compact_for_local_model(self, text: str, settings: AppSettings) -> str:
+        max_chars = 12000
+        if settings.provider.provider_type in {"ollama", "openai_local"}:
+            max_chars = 8000
+        cleaned = text.strip()
+        if len(cleaned) <= max_chars:
+            return cleaned
+        head = cleaned[: max_chars // 2]
+        tail = cleaned[-(max_chars // 2) :]
+        return f"{head}\n\n[...content trimmed for length...]\n\n{tail}"

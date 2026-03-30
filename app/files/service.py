@@ -143,13 +143,23 @@ class FileService:
             self._record("file_read", action_target, "error", str(exc))
             raise self._user_error(exc) from exc
 
-    def summarize_file(self, root: str, relative_path: str) -> str:
+    def summarize_file(
+        self,
+        root: str,
+        relative_path: str,
+        on_status=None,
+        on_partial=None,
+        is_cancelled=None,
+    ) -> str:
         action_target = f"{root}:{relative_path}"
         try:
             read_result = self.read_file(root, relative_path)
             summary = self._ai_client.summarize_text(
                 read_result.content,
                 self._settings_store.load(),
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
             )
             self._record("file_summary", action_target, "success")
             return summary

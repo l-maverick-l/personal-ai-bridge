@@ -21,7 +21,16 @@ class FakeAIClient(AIClient):
     def is_available(self, settings: AppSettings) -> bool:
         return settings.ai_mode != "skip"
 
-    def generate_text(self, settings: AppSettings, system_prompt: str, user_prompt: str) -> str:
+    def generate_text(
+        self,
+        settings: AppSettings,
+        system_prompt: str,
+        user_prompt: str,
+        on_status=None,
+        on_partial=None,
+        is_cancelled=None,
+    ) -> str:
+        _ = on_status, on_partial, is_cancelled
         self.calls.append((system_prompt, user_prompt))
         if not self.is_available(settings):
             raise Exception("AI is not configured")

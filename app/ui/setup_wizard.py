@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWizardPage,
 )
 
+from app.ai.client import AIClient
 from app.ai.providers import PROVIDER_OPTIONS, get_provider_option
 from app.email.yahoo_service import YahooMailError, YahooMailService
 from app.models.settings import AppSettings, ProviderConfig
@@ -66,7 +67,12 @@ class AiModePage(QWizardPage):
 
 
 class ProviderPage(QWizardPage):
-    def __init__(self, initial_provider: ProviderConfig) -> None:
+    def __init__(
+        self,
+        initial_provider: ProviderConfig,
+        initial_provider_timeout_local: int,
+        initial_provider_timeout_cloud: int,
+    ) -> None:
         super().__init__()
         self.setTitle("AI provider")
         self.setSubTitle("Choose a provider type and enter connection details.")
@@ -87,6 +93,12 @@ class ProviderPage(QWizardPage):
         self.model_edit = QLineEdit(initial_provider.model_name)
         self.api_key_edit = QLineEdit(initial_provider.api_key)
         self.api_key_edit.setEchoMode(QLineEdit.Password)
+        self.local_timeout_edit = QSpinBox()
+        self.local_timeout_edit.setRange(10, 1200)
+        self.local_timeout_edit.setValue(max(10, initial_provider_timeout_local))
+        self.cloud_timeout_edit = QSpinBox()
+        self.cloud_timeout_edit.setRange(10, 600)
+        self.cloud_timeout_edit.setValue(max(10, initial_provider_timeout_cloud))
 
         self.provider_list.currentItemChanged.connect(self._apply_provider_defaults)
 
@@ -94,6 +106,8 @@ class ProviderPage(QWizardPage):
         layout.addRow("Base URL", self.base_url_edit)
         layout.addRow("Model", self.model_edit)
         layout.addRow("API key", self.api_key_edit)
+        layout.addRow("Local AI timeout (seconds)", self.local_timeout_edit)
+        layout.addRow("Cloud AI timeout (seconds)", self.cloud_timeout_edit)
         self.setLayout(layout)
         self._apply_provider_defaults()
 
@@ -192,10 +206,16 @@ class FoldersPage(QWizardPage):
 
 
 class TestConnectionsPage(QWizardPage):
-    def __init__(self, settings_builder, yahoo_mail_service: YahooMailService) -> None:
+    def __init__(
+        self,
+        settings_builder,
+        yahoo_mail_service: YahooMailService,
+        ai_client: AIClient,
+    ) -> None:
         super().__init__()
         self._settings_builder = settings_builder
         self._yahoo_mail_service = yahoo_mail_service
+        self._ai_client = ai_client
         self.setTitle("Test connections")
         self.setSubTitle("Test Yahoo Mail now. You can skip AI for now and still use mail listing and reading.")
         layout = QVBoxLayout()
@@ -207,7 +227,9 @@ class TestConnectionsPage(QWizardPage):
         test_button.clicked.connect(self._test_yahoo)
         layout.addWidget(self.status_label)
         layout.addWidget(test_button)
-        layout.addWidget(QLabel("AI provider testing is optional in this phase."))
+        test_ai_button = QPushButton("Test AI provider")
+        test_ai_button.clicked.connect(self._test_ai)
+        layout.addWidget(test_ai_button)
         self.setLayout(layout)
 
     def _test_yahoo(self) -> None:
@@ -218,6 +240,21 @@ class TestConnectionsPage(QWizardPage):
         except YahooMailError as exc:
             self.status_label.setText(str(exc))
             QMessageBox.warning(self, "Yahoo connection failed", str(exc))
+
+    def _test_ai(self) -> None:
+        result = self._ai_client.test_provider(self._settings_builder())
+        details = (
+            f"Provider: {result.provider}\n"
+            f"Model: {result.model}\n"
+            f"Elapsed: {result.elapsed_seconds:.1f}s\n"
+            f"Result: {'Success' if result.success else 'Failed'}\n\n"
+            f"{result.message}"
+        )
+        self.status_label.setText(details)
+        if result.success:
+            QMessageBox.information(self, "AI provider works", details)
+        else:
+            QMessageBox.warning(self, "AI provider test failed", details)
 
 
 class FinishPage(QWizardPage):
@@ -236,6 +273,7 @@ class SetupWizard(QWizard):
         settings: AppSettings,
         allowed_folders: list[str],
         yahoo_mail_service: YahooMailService,
+        ai_client: AIClient,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -246,10 +284,14 @@ class SetupWizard(QWizard):
         initial_mode = settings.ai_mode if settings.ai_mode in {"local", "cloud", "skip"} else "skip"
         self.welcome_page = WelcomePage()
         self.ai_mode_page = AiModePage(initial_mode)
-        self.provider_page = ProviderPage(settings.provider)
+        self.provider_page = ProviderPage(
+            settings.provider,
+            initial_provider_timeout_local=settings.ai_local_timeout_seconds,
+            initial_provider_timeout_cloud=settings.ai_cloud_timeout_seconds,
+        )
         self.yahoo_page = YahooPage(settings)
         self.folders_page = FoldersPage(allowed_folders)
-        self.test_page = TestConnectionsPage(self.build_settings, yahoo_mail_service)
+        self.test_page = TestConnectionsPage(self.build_settings, yahoo_mail_service, ai_client)
         self.finish_page = FinishPage()
 
         self.addPage(self.welcome_page)
@@ -274,6 +316,8 @@ class SetupWizard(QWizard):
             yahoo_imap_port=self.yahoo_page.imap_port_edit.value(),
             yahoo_smtp_server=self.yahoo_page.smtp_server_edit.text().strip(),
             yahoo_smtp_port=self.yahoo_page.smtp_port_edit.value(),
+            ai_local_timeout_seconds=self.provider_page.local_timeout_edit.value(),
+            ai_cloud_timeout_seconds=self.provider_page.cloud_timeout_edit.value(),
             setup_complete=True,
         )
 
