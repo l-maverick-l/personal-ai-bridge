@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -45,6 +46,7 @@ class MainWindow(QMainWindow):
         self._pending_action: Callable[[], None] | None = None
         self._mail_results: list[MailSummary] = []
         self._current_email: MailMessageView | None = None
+        self._allow_remote_images_current_message = False
 
         self.setWindowTitle("Personal AI Bridge")
         self.resize(1500, 900)
@@ -241,6 +243,7 @@ class MainWindow(QMainWindow):
     def _build_email_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(14)
 
         settings_group = QGroupBox("Yahoo settings")
         settings_layout = QFormLayout(settings_group)
@@ -307,6 +310,7 @@ class MainWindow(QMainWindow):
         search_buttons.addWidget(summarize_button)
         search_layout.addLayout(search_buttons)
         self.mail_results_list = QListWidget()
+        self.mail_results_list.setMinimumHeight(180)
         self.mail_results_list.itemSelectionChanged.connect(self._mail_selection_changed)
         search_layout.addWidget(self.mail_results_list)
 
@@ -337,6 +341,7 @@ class MainWindow(QMainWindow):
         draft_layout.addLayout(draft_buttons)
         self.draft_body_input = QPlainTextEdit()
         self.draft_body_input.setPlaceholderText("The editable draft body appears here.")
+        self.draft_body_input.setMinimumHeight(130)
         draft_layout.addWidget(self.draft_body_input)
 
         layout.addWidget(settings_group)
@@ -353,16 +358,30 @@ class MainWindow(QMainWindow):
 
     def _build_preview_panel(self) -> QWidget:
         tabs = QTabWidget()
-        self.email_preview = QPlainTextEdit()
-        self.email_preview.setReadOnly(True)
-        self.email_preview.setPlainText("Select a Yahoo email and read it to preview the message body here.")
+        preview_widget = QWidget()
+        preview_layout = QVBoxLayout(preview_widget)
+        preview_layout.setContentsMargins(6, 6, 6, 6)
+        preview_layout.setSpacing(8)
+        self.email_preview_notice = QLabel("Remote images are blocked by default for privacy.")
+        self.email_preview_notice.setWordWrap(True)
+        self.load_remote_images_button = QPushButton("Load remote images")
+        self.load_remote_images_button.setEnabled(False)
+        self.load_remote_images_button.clicked.connect(self._load_remote_images_for_current_message)
+        preview_controls = QHBoxLayout()
+        preview_controls.addWidget(self.email_preview_notice, 1)
+        preview_controls.addWidget(self.load_remote_images_button, 0)
+        self.email_preview = QTextBrowser()
+        self.email_preview.setOpenExternalLinks(True)
+        self.email_preview.setHtml("<p>Select a Yahoo email and read it to preview the message body here.</p>")
+        preview_layout.addLayout(preview_controls)
+        preview_layout.addWidget(self.email_preview)
         self.file_preview = QPlainTextEdit()
         self.file_preview.setReadOnly(True)
         self.file_preview.setPlainText("Selected file contents will appear here.")
         self.search_context = QPlainTextEdit()
         self.search_context.setReadOnly(True)
         self.search_context.setPlainText("Folder listings, file search results, and Yahoo inbox results will appear here.")
-        tabs.addTab(self.email_preview, "Email preview")
+        tabs.addTab(preview_widget, "Email preview")
         tabs.addTab(self.file_preview, "File preview")
         tabs.addTab(self.search_context, "Folder/search view")
         return tabs
@@ -486,6 +505,8 @@ class MainWindow(QMainWindow):
             return
         try:
             self._current_email = self._context.yahoo_mail_service.read_email(selected.uid)
+            self._allow_remote_images_current_message = False
+            self.load_remote_images_button.setEnabled(bool(self._current_email.body_html))
             self._show_email(self._current_email)
             self._show_result(f"Read Yahoo email: {self._current_email.subject}")
         except YahooMailError as exc:
@@ -606,19 +627,33 @@ class MainWindow(QMainWindow):
         self.refresh_ui()
 
     def _show_email(self, message: MailMessageView) -> None:
-        preview = (
-            f"From: {message.sender}\n"
-            f"To: {message.recipients}\n"
-            f"Date: {message.received_at}\n"
-            f"Subject: {message.subject}\n"
-            f"Unread: {'Yes' if message.unread else 'No'}\n\n"
-            f"{message.body_text}"
+        preview_html = self._context.yahoo_mail_service.build_safe_preview_html(
+            message,
+            allow_remote_images=self._allow_remote_images_current_message,
         )
-        self.email_preview.setPlainText(preview)
+        self.email_preview.setHtml(preview_html)
+        attachments = (
+            ", ".join(f"{item.filename} ({item.size} bytes)" for item in message.attachments)
+            if message.attachments
+            else "none"
+        )
+        self.email_preview_notice.setText(
+            "Inline images: "
+            f"{len(message.inline_images)} | Attachments: {attachments}"
+            if self._allow_remote_images_current_message
+            else "Remote images are blocked by default for privacy. "
+            f"Inline images: {len(message.inline_images)} | Attachments: {attachments}"
+        )
         self.draft_to_input.setText(self.draft_to_input.text().strip() or self._extract_reply_target(message.sender))
         if not self.draft_subject_input.text().strip():
             subject = message.subject if message.subject.lower().startswith("re:") else f"Re: {message.subject}"
             self.draft_subject_input.setText(subject)
+
+    def _load_remote_images_for_current_message(self) -> None:
+        if not self._current_email:
+            return
+        self._allow_remote_images_current_message = True
+        self._show_email(self._current_email)
 
     def _extract_reply_target(self, sender: str) -> str:
         if "<" in sender and ">" in sender:
