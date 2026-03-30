@@ -490,7 +490,7 @@ class YahooMailService:
             self._record("email_read", uid, "error", str(user_error))
             raise user_error from exc
 
-    def summarize_email(self, uid: str) -> str:
+    def summarize_email(self, uid: str, on_status=None, on_partial=None, is_cancelled=None) -> str:
         message = self.read_email(uid)
         settings = self._settings_store.load()
         try:
@@ -505,12 +505,15 @@ class YahooMailService:
                     f"Received: {message.received_at}\n\n"
                     f"Body:\n{message.body_text[:12000]}"
                 ),
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
             )
         except (AIUnavailableError, AIClientError) as exc:
             self._record("email_summarize", uid, "error", str(exc))
             raise YahooMailError(str(exc)) from exc
 
-    def draft_reply(self, uid: str, user_notes: str = "") -> OutgoingDraft:
+    def draft_reply(self, uid: str, user_notes: str = "", on_status=None, on_partial=None, is_cancelled=None) -> OutgoingDraft:
         message = self.read_email(uid)
         settings = self._settings_store.load()
         try:
@@ -522,9 +525,12 @@ class YahooMailService:
                     "Do not invent facts that are not in the original message or user notes.\n\n"
                     f"Original sender: {message.sender}\n"
                     f"Original subject: {message.subject}\n"
-                    f"Original body:\n{message.body_text[:10000]}\n\n"
+                    f"Original body:\n{message.body_text[:8000]}\n\n"
                     f"User notes for the reply:\n{user_notes or 'No extra notes provided.'}"
                 ),
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
             )
         except (AIUnavailableError, AIClientError) as exc:
             self._record("email_draft_reply", uid, "error", str(exc))
@@ -537,7 +543,7 @@ class YahooMailService:
             body=draft_text,
         )
 
-    def draft_new_email(self, to_address: str, subject: str, user_notes: str) -> OutgoingDraft:
+    def draft_new_email(self, to_address: str, subject: str, user_notes: str, on_status=None, on_partial=None, is_cancelled=None) -> OutgoingDraft:
         settings = self._settings_store.load()
         try:
             draft_text = self._ai_client.generate_text(
@@ -548,8 +554,11 @@ class YahooMailService:
                     "Keep it clear, specific, and not overly formal.\n\n"
                     f"To: {to_address or 'Not specified yet'}\n"
                     f"Subject: {subject or 'Not specified yet'}\n"
-                    f"What the user wants to say:\n{user_notes or 'No notes provided.'}"
+                    f"What the user wants to say:\n{(user_notes or 'No notes provided.')[:4000]}"
                 ),
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
             )
         except (AIUnavailableError, AIClientError) as exc:
             self._record("email_draft_new", to_address or subject or "new", "error", str(exc))

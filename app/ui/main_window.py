@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QPoint, Qt, QTimer
+from PySide6.QtCore import QDate, QPoint, Qt, QThread, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -42,6 +42,7 @@ from app.core.app_context import AppContext
 from app.email.yahoo_service import MailMessageView, MailSummary, OutgoingDraft, YahooMailError
 from app.files.service import DirectoryListing, FileEntry, FileOperationError, FileReadResult
 from app.models.settings import AppSettings
+from app.ui.ai_worker import AIWorker
 from app.ui.setup_wizard import SetupWizard
 
 
@@ -67,6 +68,8 @@ class MainWindow(QMainWindow):
         self._folder_view_root = ""
         self._folder_view_relative_path = ""
         self._folder_view_history: list[str] = []
+        self._ai_thread: QThread | None = None
+        self._ai_worker: AIWorker | None = None
 
         self.setWindowTitle("Personal AI Bridge")
         self.resize(1500, 900)
@@ -126,9 +129,12 @@ class MainWindow(QMainWindow):
         refresh_files_button.clicked.connect(self.list_selected_folder)
         refresh_mail_button = QPushButton("Refresh Yahoo inbox")
         refresh_mail_button.clicked.connect(self.list_inbox)
+        test_ai_button = QPushButton("Test AI provider")
+        test_ai_button.clicked.connect(self.test_ai_provider)
         quick_layout.addWidget(setup_button)
         quick_layout.addWidget(refresh_files_button)
         quick_layout.addWidget(refresh_mail_button)
+        quick_layout.addWidget(test_ai_button)
 
         recent_group = QGroupBox("Recent actions")
         recent_layout = QVBoxLayout(recent_group)
@@ -248,11 +254,17 @@ class MainWindow(QMainWindow):
 
         results_group = QGroupBox("Results")
         results_layout = QVBoxLayout(results_group)
+        self.ai_progress_label = QLabel("AI status: idle")
+        self.cancel_ai_button = QPushButton("Cancel AI task")
+        self.cancel_ai_button.setEnabled(False)
+        self.cancel_ai_button.clicked.connect(self.cancel_ai_task)
         self.results_output = QPlainTextEdit()
         self.results_output.setReadOnly(True)
         self.results_output.setPlainText(
             "Choose a tab to work with files or Yahoo Mail. Mail listing and reading work without AI; summarizing and drafting need AI."
         )
+        results_layout.addWidget(self.ai_progress_label)
+        results_layout.addWidget(self.cancel_ai_button)
         results_layout.addWidget(self.results_output)
 
         layout.addWidget(browser_group)
@@ -483,6 +495,7 @@ class MainWindow(QMainWindow):
             self._settings,
             self._context.folder_registry.list_folders(),
             self._context.yahoo_mail_service,
+            self._context.ai_client,
             self,
         )
         if wizard.exec():
@@ -575,39 +588,56 @@ class MainWindow(QMainWindow):
         if not selected:
             self._show_result("Select a Yahoo message before asking for a summary.")
             return
-        try:
-            summary = self._context.yahoo_mail_service.summarize_email(selected.uid)
-            self.results_output.setPlainText(summary)
-            self.refresh_ui()
-        except YahooMailError as exc:
-            self._show_error("Could not summarize Yahoo email", exc)
+        self._start_ai_task(
+            task_name="Summarize Yahoo email",
+            task=lambda on_status, on_partial, is_cancelled: self._context.yahoo_mail_service.summarize_email(
+                selected.uid,
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
+            ),
+            on_success=lambda summary: self.results_output.setPlainText(str(summary)),
+            stream_to_results=True,
+        )
 
     def draft_reply(self) -> None:
         selected = self._selected_mail_summary()
         if not selected:
             self._show_result("Select a Yahoo message before drafting a reply.")
             return
-        try:
-            draft = self._context.yahoo_mail_service.draft_reply(
+        self._start_ai_task(
+            task_name="Draft reply",
+            task=lambda on_status, on_partial, is_cancelled: self._context.yahoo_mail_service.draft_reply(
                 selected.uid,
                 self.draft_prompt_input.toPlainText(),
-            )
-            self._apply_draft(draft)
-            self._show_result("Draft reply created. Review and edit it before sending.")
-        except YahooMailError as exc:
-            self._show_error("Could not draft reply", exc)
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
+            ),
+            on_success=lambda draft: (
+                self._apply_draft(draft),
+                self._show_result("Draft reply created. Review and edit it before sending."),
+            ),
+            stream_to_draft=True,
+        )
 
     def draft_new_email(self) -> None:
-        try:
-            draft = self._context.yahoo_mail_service.draft_new_email(
+        self._start_ai_task(
+            task_name="Draft new email",
+            task=lambda on_status, on_partial, is_cancelled: self._context.yahoo_mail_service.draft_new_email(
                 self.draft_to_input.text(),
                 self.draft_subject_input.text(),
                 self.draft_prompt_input.toPlainText(),
-            )
-            self._apply_draft(draft)
-            self._show_result("New email draft created. Review and edit it before sending.")
-        except YahooMailError as exc:
-            self._show_error("Could not draft new email", exc)
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
+            ),
+            on_success=lambda draft: (
+                self._apply_draft(draft),
+                self._show_result("New email draft created. Review and edit it before sending."),
+            ),
+            stream_to_draft=True,
+        )
 
     def request_send_email(self) -> None:
         draft = self._current_draft()
@@ -780,12 +810,18 @@ class MainWindow(QMainWindow):
         root = self._selected_root()
         if not root:
             return
-        try:
-            summary = self._context.file_service.summarize_file(root, self.path_input.text())
-            self.results_output.setPlainText(summary)
-            self.refresh_ui()
-        except FileOperationError as exc:
-            self._show_error("Could not summarize file", exc)
+        self._start_ai_task(
+            task_name="Summarize file",
+            task=lambda on_status, on_partial, is_cancelled: self._context.file_service.summarize_file(
+                root,
+                self.path_input.text(),
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
+            ),
+            on_success=lambda summary: self.results_output.setPlainText(str(summary)),
+            stream_to_results=True,
+        )
 
     def create_file(self) -> None:
         root = self._selected_root()
@@ -1136,6 +1172,66 @@ class MainWindow(QMainWindow):
 
     def _show_file(self, read_result: FileReadResult) -> None:
         self.file_preview.setPlainText(read_result.content)
+
+    def test_ai_provider(self) -> None:
+        result = self._context.ai_client.test_provider(self._settings)
+        details = (
+            f"Provider: {result.provider}\n"
+            f"Model: {result.model}\n"
+            f"Elapsed: {result.elapsed_seconds:.1f}s\n"
+            f"Result: {'Success' if result.success else 'Failed'}\n\n"
+            f"{result.message}"
+        )
+        if result.success:
+            self._show_result(details)
+        else:
+            self._show_error("AI provider test failed", RuntimeError(details))
+
+    def _start_ai_task(
+        self,
+        task_name: str,
+        task,
+        on_success,
+        stream_to_results: bool = False,
+        stream_to_draft: bool = False,
+    ) -> None:
+        if self._ai_thread and self._ai_thread.isRunning():
+            self._show_result("Another AI task is still running. Cancel it or wait for it to finish.")
+            return
+        self.ai_progress_label.setText("AI status: Connecting to AI provider")
+        self.cancel_ai_button.setEnabled(True)
+
+        thread = QThread(self)
+        worker = AIWorker(task)
+        worker.moveToThread(thread)
+        worker.status.connect(lambda text: self.ai_progress_label.setText(f"AI status: {text}"))
+        if stream_to_results:
+            worker.partial.connect(lambda text: self.results_output.setPlainText(text))
+        if stream_to_draft:
+            worker.partial.connect(lambda text: self.draft_body_input.setPlainText(text))
+        worker.completed.connect(on_success)
+        worker.failed.connect(lambda message: self._show_error(f"{task_name} failed", RuntimeError(message)))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.started.connect(worker.run)
+        thread.finished.connect(self._reset_ai_task_state)
+
+        self._ai_thread = thread
+        self._ai_worker = worker
+        thread.start()
+
+    def cancel_ai_task(self) -> None:
+        if self._ai_worker:
+            self._ai_worker.cancel()
+            self.ai_progress_label.setText("AI status: Cancelling request")
+
+    def _reset_ai_task_state(self) -> None:
+        self._ai_thread = None
+        self._ai_worker = None
+        self.cancel_ai_button.setEnabled(False)
+        if "failed" not in self.ai_progress_label.text().lower():
+            self.ai_progress_label.setText("AI status: idle")
 
     def _show_result(self, message: str) -> None:
         self.results_output.setPlainText(message)
