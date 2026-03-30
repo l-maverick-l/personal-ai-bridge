@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import unittest
 from email.message import EmailMessage
+from urllib.request import Request
 
 from app.ai.client import AIClient
 from app.data.action_log import ActionLogger
@@ -111,6 +112,31 @@ class FailingIMAP(FakeIMAP):
         )
 
 
+class FakeHTTPResponse:
+    def __init__(self, payload: bytes, content_type: str) -> None:
+        self._payload = payload
+        self.headers = {"Content-Type": content_type}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            return self._payload
+        return self._payload[:size]
+
+
+def fake_remote_opener(request: Request, timeout_seconds: float):
+    _ = timeout_seconds
+    url = request.full_url
+    if "pixel.png" in url:
+        return FakeHTTPResponse(b"\x89PNGfake", "image/png")
+    raise OSError("not found")
+
+
 class YahooMailServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.connection = sqlite3.connect(":memory:")
@@ -135,6 +161,7 @@ class YahooMailServiceTests(unittest.TestCase):
             ai_client=self.ai_client,
             imap_factory=FakeIMAP,
             smtp_factory=FakeSMTP,
+            remote_url_opener=fake_remote_opener,
         )
 
     def tearDown(self) -> None:
@@ -206,7 +233,26 @@ class YahooMailServiceTests(unittest.TestCase):
         self.assertNotIn("tracker.example.com", blocked)
 
         allowed = self.service.build_safe_preview_html(view, allow_remote_images=True)
-        self.assertIn("tracker.example.com", allowed)
+        self.assertIn("data:image/png;base64", allowed)
+        self.assertNotIn("tracker.example.com", allowed)
+
+    def test_preview_keeps_safe_inline_styles(self) -> None:
+        message = EmailMessage()
+        message["From"] = "Example <example@example.com>"
+        message["To"] = "user@yahoo.com"
+        message["Subject"] = "Style sample"
+        message["Date"] = "Tue, 18 Mar 2025 10:00:00 +0000"
+        message.add_alternative(
+            '<html><body><div style="width:600px;background-color:#eee;position:fixed;'
+            'background-image:url(https://bad.example/x.png);padding:12px">Hello</div></body></html>',
+            subtype="html",
+        )
+
+        view = self.service._build_message_view("777", message, b"")
+        preview = self.service.build_safe_preview_html(view, allow_remote_images=False)
+        self.assertIn('style="width: 600px; background-color: #eee; padding: 12px"', preview)
+        self.assertNotIn("position:fixed", preview)
+        self.assertNotIn("background-image", preview)
 
     def test_send_email_uses_smtp(self) -> None:
         self.service.send_email(
