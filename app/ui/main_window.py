@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -123,9 +124,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
 
         self.center_tabs = QTabWidget()
-        self.center_tabs.addTab(self._build_files_tab(), "Files")
-        self.center_tabs.addTab(self._build_email_tab(), "Yahoo Mail")
-        layout.addWidget(self.center_tabs)
+        self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_files_tab()), "Files")
+        self.center_tabs.addTab(self._wrap_in_scroll_area(self._build_email_tab()), "Yahoo Mail")
 
         actions_confirm_group = QGroupBox("Pending confirmation")
         actions_confirm_layout = QVBoxLayout(actions_confirm_group)
@@ -139,7 +139,15 @@ class MainWindow(QMainWindow):
         self.confirm_button.clicked.connect(self.confirm_pending_action)
         actions_confirm_layout.addWidget(self.proposed_actions)
         actions_confirm_layout.addWidget(self.confirm_button)
-        layout.addWidget(actions_confirm_group)
+
+        self.center_splitter = QSplitter(Qt.Vertical)
+        self.center_splitter.addWidget(self.center_tabs)
+        self.center_splitter.addWidget(actions_confirm_group)
+        self.center_splitter.setChildrenCollapsible(False)
+        self.center_splitter.setStretchFactor(0, 1)
+        self.center_splitter.setStretchFactor(1, 0)
+
+        layout.addWidget(self.center_splitter)
         return widget
 
     def _build_files_tab(self) -> QWidget:
@@ -195,7 +203,7 @@ class MainWindow(QMainWindow):
         self.create_content_input.setPlaceholderText(
             "Optional text content for a new .txt, .md, .csv, or .json file"
         )
-        self.create_content_input.setFixedHeight(120)
+        self.create_content_input.setMaximumHeight(120)
         actions_layout.addWidget(self.create_content_input)
 
         action_buttons = QHBoxLayout()
@@ -311,7 +319,7 @@ class MainWindow(QMainWindow):
         self.draft_prompt_input.setPlaceholderText(
             "Optional notes for the AI draft, such as tone, promised dates, or what you want to ask."
         )
-        self.draft_prompt_input.setFixedHeight(90)
+        self.draft_prompt_input.setMaximumHeight(90)
         draft_form.addRow("To", self.draft_to_input)
         draft_form.addRow("Subject", self.draft_subject_input)
         draft_layout.addLayout(draft_form)
@@ -335,6 +343,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(search_group)
         layout.addWidget(draft_group)
         return widget
+
+
+    def _wrap_in_scroll_area(self, content: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        return scroll
 
     def _build_preview_panel(self) -> QWidget:
         tabs = QTabWidget()
