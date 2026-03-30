@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 from dataclasses import dataclass
@@ -152,6 +153,8 @@ class AIClient:
         on_partial: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
         json_mode: bool = False,
+        json_schema: dict[str, Any] | None = None,
+        disable_thinking: bool = False,
     ) -> str:
         payload = {
             "model": model_name,
@@ -163,46 +166,59 @@ class AIClient:
             "options": {"temperature": 0.2},
         }
         if json_mode:
-            payload["format"] = "json"
+            payload["format"] = json_schema or "json"
             payload["options"] = {"temperature": 0}
+            if disable_thinking:
+                payload["think"] = False
         if on_status:
             on_status("Connecting to AI provider")
-        response_chunks = self._stream_json_lines(
-            f"{base_url.rstrip('/')}/api/chat",
-            payload,
-            timeout_seconds=request_timeout,
-            on_status=on_status,
-            is_cancelled=is_cancelled,
-        )
+        try:
+            response_chunks = self._stream_json_lines(
+                f"{base_url.rstrip('/')}/api/chat",
+                payload,
+                timeout_seconds=request_timeout,
+                on_status=on_status,
+                is_cancelled=is_cancelled,
+            )
+        except AIClientError as exc:
+            if not self._should_retry_without_thinking(disable_thinking=disable_thinking, error=exc):
+                raise
+            payload.pop("think", None)
+            response_chunks = self._stream_json_lines(
+                f"{base_url.rstrip('/')}/api/chat",
+                payload,
+                timeout_seconds=request_timeout,
+                on_status=on_status,
+                is_cancelled=is_cancelled,
+            )
         chunks: list[str] = []
-        saw_chunks = False
-        saw_text_chunk = False
+        saw_reasoning_chunk = False
+        saw_response_events = False
         for item in response_chunks:
-            saw_chunks = True
-            message = item.get("message")
-            piece = ""
-            if isinstance(message, dict):
-                piece = str(message.get("content", ""))
+            piece, saw_reasoning = self._extract_ollama_chunk_output(item)
+            saw_reasoning_chunk = saw_reasoning_chunk or saw_reasoning
+            saw_response_events = True
             if piece:
-                saw_text_chunk = True
                 chunks.append(piece)
                 if on_partial:
                     on_partial("".join(chunks))
         summary = "".join(chunks).strip()
         if not summary:
-            if saw_chunks and saw_text_chunk:
+            if saw_response_events and saw_reasoning_chunk:
                 raise AIModelOutputError(
-                    reason="whitespace_only",
-                    message="The local model returned whitespace-only output.",
+                    reason="reasoning_only_stream",
+                    message=(
+                        "The local model streamed reasoning/thinking events but never emitted a final answer."
+                    ),
                 )
-            if saw_chunks:
+            if saw_response_events:
                 raise AIModelOutputError(
-                    reason="no_text_tokens",
-                    message="The local model produced response events but no text tokens.",
+                    reason="no_final_answer",
+                    message="The local model returned events but never emitted a usable final answer.",
                 )
             raise AIModelOutputError(
-                reason="no_tokens",
-                message="The local model returned no generation output.",
+                reason="no_stream",
+                message="The local model returned no stream events.",
             )
         return summary
 
@@ -217,6 +233,33 @@ class AIClient:
         provider = settings.provider
         request_timeout = self._timeout_for_settings(settings)
         if provider.provider_type == "ollama":
+            planner_schema = {
+                "type": "object",
+                "properties": {
+                    "intent": {"type": "string"},
+                    "tool_calls": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "arguments": {"type": "object"},
+                            },
+                            "required": ["name", "arguments"],
+                        },
+                    },
+                    "final_answer": {"type": "string"},
+                    "proposed_actions": {"type": "array"},
+                    "needs_confirmation": {"type": "boolean"},
+                },
+                "required": [
+                    "intent",
+                    "tool_calls",
+                    "final_answer",
+                    "proposed_actions",
+                    "needs_confirmation",
+                ],
+            }
             return self._call_ollama(
                 provider.base_url,
                 provider.model_name,
@@ -226,6 +269,8 @@ class AIClient:
                 on_status=on_status,
                 is_cancelled=is_cancelled,
                 json_mode=True,
+                json_schema=planner_schema,
+                disable_thinking=True,
             )
         return self.generate_text(
             settings=settings,
@@ -381,3 +426,31 @@ class AIClient:
         head = cleaned[: max_chars // 2]
         tail = cleaned[-(max_chars // 2) :]
         return f"{head}\n\n[...content trimmed for length...]\n\n{tail}"
+
+    def _extract_ollama_chunk_output(self, chunk: dict[str, Any]) -> tuple[str, bool]:
+        reasoning_fields = ["thinking", "reasoning", "thought"]
+        message = chunk.get("message")
+        output_parts: list[str] = []
+        saw_reasoning = False
+        if isinstance(message, dict):
+            message_content = str(message.get("content") or "")
+            if message_content:
+                output_parts.append(message_content)
+            for field in reasoning_fields:
+                if str(message.get(field) or "").strip():
+                    saw_reasoning = True
+        response_content = str(chunk.get("response") or "")
+        if response_content:
+            output_parts.append(response_content)
+        for field in reasoning_fields:
+            if str(chunk.get(field) or "").strip():
+                saw_reasoning = True
+        return "".join(output_parts), saw_reasoning
+
+    def _should_retry_without_thinking(self, disable_thinking: bool, error: Exception) -> bool:
+        if not disable_thinking:
+            return False
+        message = str(error).lower()
+        if "http error 400" not in message:
+            return False
+        return bool(re.search(r"(unknown|invalid).*(think)", message))
