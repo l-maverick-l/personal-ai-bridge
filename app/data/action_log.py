@@ -4,35 +4,37 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from app.data.database import APP_NAME, get_app_data_dir
+from app.data.database import APP_NAME, get_app_data_dir, open_database_connection
 
 LOGGER_NAME = APP_NAME
 
 
 class ActionLogger:
-    def __init__(self, connection: sqlite3.Connection) -> None:
-        self._connection = connection
+    def __init__(self, database_path: Path | str) -> None:
+        self._database_path = Path(database_path)
 
     def record(self, action_type: str, target: str, status: str, error_message: str = "") -> None:
-        self._connection.execute(
-            """
-            INSERT INTO action_log (action_type, target, status, error_message)
-            VALUES (?, ?, ?, ?)
-            """,
-            (action_type, target, status, error_message),
-        )
-        self._connection.commit()
+        with open_database_connection(self._database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO action_log (action_type, target, status, error_message)
+                VALUES (?, ?, ?, ?)
+                """,
+                (action_type, target, status, error_message),
+            )
+            connection.commit()
 
     def recent_entries(self, limit: int = 20) -> list[sqlite3.Row]:
-        rows = self._connection.execute(
-            """
-            SELECT timestamp, action_type, target, status, error_message
-            FROM action_log
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+        with open_database_connection(self._database_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT timestamp, action_type, target, status, error_message
+                FROM action_log
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
         return list(rows)
 
 
