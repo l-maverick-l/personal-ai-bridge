@@ -70,6 +70,17 @@ class FileService:
     def list_allowed_roots(self) -> list[str]:
         return self._folder_registry.list_folders()
 
+    def add_allowed_root(self, folder_path: str) -> str:
+        normalized = self._folder_registry.add_folder(folder_path)
+        self._record("approved_root_add", normalized, "success")
+        return normalized
+
+    def remove_allowed_root(self, folder_path: str) -> str:
+        normalized = str(PathGuard.normalize(folder_path))
+        self._folder_registry.remove_folder(normalized)
+        self._record("approved_root_remove", normalized, "success")
+        return normalized
+
     def list_directory(self, root: str, relative_path: str = "") -> DirectoryListing:
         action_target = f"{root}:{relative_path or '.'}"
         try:
