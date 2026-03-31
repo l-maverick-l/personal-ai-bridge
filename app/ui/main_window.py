@@ -396,6 +396,9 @@ class MainWindow(QMainWindow):
         draft_buttons.addWidget(draft_new_button)
         draft_buttons.addWidget(send_button)
         draft_layout.addLayout(draft_buttons)
+        self.yahoo_draft_status_label = QLabel("Draft status: idle")
+        self.yahoo_draft_status_label.setWordWrap(True)
+        draft_layout.addWidget(self.yahoo_draft_status_label)
         self.draft_body_input = QPlainTextEdit()
         self.draft_body_input.setPlaceholderText("The editable draft body appears here.")
         self.draft_body_input.setMinimumHeight(130)
@@ -667,6 +670,7 @@ class MainWindow(QMainWindow):
         if not selected:
             self._show_result("Select a Yahoo message before drafting a reply.")
             return
+        self._set_yahoo_draft_status("connecting to AI provider")
         self._start_ai_task(
             task_name="Draft reply",
             task=lambda on_status, on_partial, is_cancelled: self._context.yahoo_mail_service.draft_reply(
@@ -678,12 +682,16 @@ class MainWindow(QMainWindow):
             ),
             on_success=lambda draft: (
                 self._apply_draft(draft),
+                self._set_yahoo_draft_status("draft applied"),
                 self._show_result("Draft reply created. Review and edit it before sending."),
             ),
             stream_to_draft=True,
+            on_status=self._on_yahoo_draft_status,
+            on_failure=self._on_yahoo_draft_failure,
         )
 
     def draft_new_email(self) -> None:
+        self._set_yahoo_draft_status("connecting to AI provider")
         self._start_ai_task(
             task_name="Draft new email",
             task=lambda on_status, on_partial, is_cancelled: self._context.yahoo_mail_service.draft_new_email(
@@ -696,9 +704,12 @@ class MainWindow(QMainWindow):
             ),
             on_success=lambda draft: (
                 self._apply_draft(draft),
+                self._set_yahoo_draft_status("draft applied"),
                 self._show_result("New email draft created. Review and edit it before sending."),
             ),
             stream_to_draft=True,
+            on_status=self._on_yahoo_draft_status,
+            on_failure=self._on_yahoo_draft_failure,
         )
 
     def request_send_email(self) -> None:
@@ -737,6 +748,28 @@ class MainWindow(QMainWindow):
         self.draft_to_input.setText(draft.to_address)
         self.draft_subject_input.setText(draft.subject)
         self.draft_body_input.setPlainText(draft.body)
+        self._set_yahoo_draft_status("draft applied — inserted into draft body field")
+
+    def _on_yahoo_draft_status(self, text: str) -> None:
+        mapping = {
+            "Connecting to AI provider": "connecting to AI provider",
+            "Waiting for model": "waiting for model",
+            "Generating response": "generating draft",
+            "Retrying with stricter final-answer mode": "generating draft (retry with stricter final-answer mode)",
+        }
+        normalized = mapping.get(text, text.lower())
+        self._set_yahoo_draft_status(normalized)
+
+    def _on_yahoo_draft_failure(self, failure) -> None:
+        exc = self._failure_to_exception(failure)
+        message = str(exc)
+        self._set_yahoo_draft_status(f"draft failed — {message}")
+        self.draft_body_input.setPlainText(f"[Draft generation failed]\n{message}")
+        self.results_output.setPlainText(message)
+        self.refresh_ui()
+
+    def _set_yahoo_draft_status(self, message: str) -> None:
+        self.yahoo_draft_status_label.setText(f"Draft status: {message}")
 
     def _current_draft(self) -> OutgoingDraft:
         return OutgoingDraft(

@@ -68,6 +68,23 @@ class AIClientOllamaTests(unittest.TestCase):
         self.assertEqual(client.payloads[0].get("think"), False)
         self.assertNotIn("think", client.payloads[1])
 
+    def test_generate_text_retries_when_first_attempt_is_reasoning_only(self) -> None:
+        client = StubAIClient(
+            chunks_by_call=[
+                [{"message": {"thinking": "analyzing"}}, {"done": True}],
+                [{"message": {"content": "Final draft body"}}],
+            ]
+        )
+        output = client.generate_text(self.settings, "sys", "usr")
+        self.assertEqual(output, "Final draft body")
+        self.assertEqual(client.payloads[0].get("think"), False)
+
+    def test_generate_text_raises_empty_output_reason(self) -> None:
+        client = StubAIClient(chunks_by_call=[[{"message": {"content": "   "}}, {"done": True}]])
+        with self.assertRaises(AIModelOutputError) as ctx:
+            client.generate_text(self.settings, "sys", "usr")
+        self.assertEqual(ctx.exception.reason, "empty_output")
+
     def test_assistant_maps_reasoning_only_error(self) -> None:
         message = AssistantService._planner_error_from_exception(  # type: ignore[attr-defined]
             AssistantService,
