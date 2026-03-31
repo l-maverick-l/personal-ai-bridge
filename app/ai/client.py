@@ -4,6 +4,7 @@ import json
 import re
 import socket
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib import error, request
@@ -93,12 +94,12 @@ class AIClient:
         provider = settings.provider
         request_timeout = self._timeout_for_settings(settings)
         if provider.provider_type == "ollama":
-            return self._call_ollama(
-                provider.base_url,
-                provider.model_name,
-                system_prompt,
-                user_prompt,
-                request_timeout,
+            return self._generate_ollama_text_with_retries(
+                base_url=provider.base_url,
+                model_name=provider.model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                request_timeout=request_timeout,
                 on_status=on_status,
                 on_partial=on_partial,
                 is_cancelled=is_cancelled,
@@ -114,6 +115,24 @@ class AIClient:
                 on_status=on_status,
             )
         raise AIUnavailableError(f"Unsupported AI provider type: {provider.provider_type}")
+
+    def generate_final_text(
+        self,
+        settings: AppSettings,
+        system_prompt: str,
+        user_prompt: str,
+        on_status: Callable[[str], None] | None = None,
+        on_partial: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> str:
+        return self.generate_text(
+            settings=settings,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            on_status=on_status,
+            on_partial=on_partial,
+            is_cancelled=is_cancelled,
+        )
 
     def test_provider(self, settings: AppSettings) -> AIProviderTestResult:
         start = time.monotonic()
@@ -155,6 +174,7 @@ class AIClient:
         json_mode: bool = False,
         json_schema: dict[str, Any] | None = None,
         disable_thinking: bool = False,
+        options_override: dict[str, Any] | None = None,
     ) -> str:
         payload = {
             "model": model_name,
@@ -165,11 +185,13 @@ class AIClient:
             "stream": True,
             "options": {"temperature": 0.2},
         }
+        if options_override:
+            payload["options"] = options_override
         if json_mode:
             payload["format"] = json_schema or "json"
-            payload["options"] = {"temperature": 0}
-            if disable_thinking:
-                payload["think"] = False
+            payload["options"] = options_override or {"temperature": 0}
+        if disable_thinking:
+            payload["think"] = False
         if on_status:
             on_status("Connecting to AI provider")
         try:
@@ -191,36 +213,57 @@ class AIClient:
                 on_status=on_status,
                 is_cancelled=is_cancelled,
             )
-        chunks: list[str] = []
-        saw_reasoning_chunk = False
-        saw_response_events = False
-        for item in response_chunks:
-            piece, saw_reasoning = self._extract_ollama_chunk_output(item)
-            saw_reasoning_chunk = saw_reasoning_chunk or saw_reasoning
-            saw_response_events = True
-            if piece:
-                chunks.append(piece)
-                if on_partial:
-                    on_partial("".join(chunks))
-        summary = "".join(chunks).strip()
-        if not summary:
-            if saw_response_events and saw_reasoning_chunk:
-                raise AIModelOutputError(
-                    reason="reasoning_only_stream",
-                    message=(
-                        "The local model streamed reasoning/thinking events but never emitted a final answer."
-                    ),
-                )
-            if saw_response_events:
-                raise AIModelOutputError(
-                    reason="no_final_answer",
-                    message="The local model returned events but never emitted a usable final answer.",
-                )
-            raise AIModelOutputError(
-                reason="no_stream",
-                message="The local model returned no stream events.",
+        return self._collect_ollama_stream_text(response_chunks, on_partial=on_partial)
+
+    def _generate_ollama_text_with_retries(
+        self,
+        base_url: str,
+        model_name: str,
+        system_prompt: str,
+        user_prompt: str,
+        request_timeout: int,
+        on_status: Callable[[str], None] | None = None,
+        on_partial: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> str:
+        try:
+            return self._call_ollama(
+                base_url=base_url,
+                model_name=model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                request_timeout=request_timeout,
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
+                disable_thinking=True,
             )
-        return summary
+        except AIModelOutputError as exc:
+            if exc.reason not in {"reasoning_only_stream", "no_final_answer"}:
+                raise
+            if on_status:
+                on_status("Retrying with stricter final-answer mode")
+            stricter_system_prompt = (
+                f"{system_prompt.strip()}\n\n"
+                "Return final answer text only. Do not include reasoning, thoughts, analysis, "
+                "JSON, markdown fences, or meta commentary."
+            ).strip()
+            stricter_user_prompt = (
+                f"{user_prompt.strip()}\n\n"
+                "Important: Output only the final answer text."
+            ).strip()
+            return self._call_ollama(
+                base_url=base_url,
+                model_name=model_name,
+                system_prompt=stricter_system_prompt,
+                user_prompt=stricter_user_prompt,
+                request_timeout=request_timeout,
+                on_status=on_status,
+                on_partial=on_partial,
+                is_cancelled=is_cancelled,
+                disable_thinking=True,
+                options_override={"temperature": 0},
+            )
 
     def generate_structured_json(
         self,
@@ -378,7 +421,9 @@ class AIClient:
                         continue
                     chunk = json.loads(line)
                     parsed.append(chunk)
-                    if chunk.get("response"):
+                    message = chunk.get("message")
+                    message_has_content = isinstance(message, dict) and bool(str(message.get("content") or "").strip())
+                    if chunk.get("response") or message_has_content:
                         if not saw_tokens and on_status:
                             on_status("Generating response")
                         saw_tokens = True
@@ -446,6 +491,45 @@ class AIClient:
             if str(chunk.get(field) or "").strip():
                 saw_reasoning = True
         return "".join(output_parts), saw_reasoning
+
+    def _collect_ollama_stream_text(
+        self,
+        response_chunks: list[dict[str, Any]],
+        on_partial: Callable[[str], None] | None = None,
+    ) -> str:
+        chunks: list[str] = []
+        saw_reasoning_chunk = False
+        saw_response_events = False
+        for item in response_chunks:
+            if not isinstance(item, Mapping):
+                raise AIModelOutputError(
+                    reason="malformed_content",
+                    message="The local model returned malformed stream content.",
+                )
+            piece, saw_reasoning = self._extract_ollama_chunk_output(dict(item))
+            saw_reasoning_chunk = saw_reasoning_chunk or saw_reasoning
+            saw_response_events = True
+            if piece:
+                chunks.append(piece)
+                if on_partial:
+                    on_partial("".join(chunks))
+        summary = "".join(chunks)
+        if not saw_response_events:
+            raise AIModelOutputError(
+                reason="no_stream",
+                message="The local model returned no stream events.",
+            )
+        if not summary.strip():
+            if saw_reasoning_chunk:
+                raise AIModelOutputError(
+                    reason="reasoning_only_stream",
+                    message="The local model streamed reasoning/thinking events but never emitted a final answer.",
+                )
+            raise AIModelOutputError(
+                reason="empty_output",
+                message="The local model returned an empty or whitespace-only final output.",
+            )
+        return summary.strip()
 
     def _should_retry_without_thinking(self, disable_thinking: bool, error: Exception) -> bool:
         if not disable_thinking:

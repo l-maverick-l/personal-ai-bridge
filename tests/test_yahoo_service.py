@@ -18,6 +18,7 @@ class FakeAIClient(AIClient):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[tuple[str, str]] = []
+        self.next_response = "Generated draft or summary"
 
     def is_available(self, settings: AppSettings) -> bool:
         return settings.ai_mode != "skip"
@@ -35,7 +36,25 @@ class FakeAIClient(AIClient):
         self.calls.append((system_prompt, user_prompt))
         if not self.is_available(settings):
             raise Exception("AI is not configured")
-        return "Generated draft or summary"
+        return self.next_response
+
+    def generate_final_text(
+        self,
+        settings: AppSettings,
+        system_prompt: str,
+        user_prompt: str,
+        on_status=None,
+        on_partial=None,
+        is_cancelled=None,
+    ) -> str:
+        return self.generate_text(
+            settings=settings,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            on_status=on_status,
+            on_partial=on_partial,
+            is_cancelled=is_cancelled,
+        )
 
 
 class FakeIMAP:
@@ -212,6 +231,12 @@ class YahooMailServiceTests(unittest.TestCase):
         new_draft = self.service.draft_new_email("team@example.com", "Hello", "Share the update")
         self.assertEqual(new_draft.body, "Generated draft or summary")
         self.assertEqual(len(self.ai_client.calls), 3)
+
+    def test_draft_generation_rejects_json_only_output(self) -> None:
+        self.ai_client.next_response = '{"draft":"hello"}'
+        with self.assertRaises(YahooMailError) as ctx:
+            self.service.draft_new_email("team@example.com", "Hello", "Share the update")
+        self.assertIn("malformed", str(ctx.exception).lower())
 
     def test_html_and_inline_image_rendering(self) -> None:
         message = EmailMessage()

@@ -16,7 +16,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
-from app.ai.client import AIClient, AIClientError, AIUnavailableError
+from app.ai.client import AIClient, AIClientError, AIModelOutputError, AITimeoutError, AIUnavailableError
 from app.data.action_log import ActionLogger
 from app.data.settings_store import SettingsStore
 from app.models.settings import AppSettings
@@ -494,7 +494,7 @@ class YahooMailService:
         message = self.read_email(uid)
         settings = self._settings_store.load()
         try:
-            return self._ai_client.generate_text(
+            return self._ai_client.generate_final_text(
                 settings,
                 system_prompt="You summarize email messages for a non-technical user.",
                 user_prompt=(
@@ -517,12 +517,18 @@ class YahooMailService:
         message = self.read_email(uid)
         settings = self._settings_store.load()
         try:
-            draft_text = self._ai_client.generate_text(
+            draft_text = self._ai_client.generate_final_text(
                 settings,
-                system_prompt="You draft clear, polite email replies for a non-technical user.",
+                system_prompt=(
+                    "You draft clear, polite email replies for a non-technical user. "
+                    "Return only the final email body text that can be pasted directly into a draft."
+                ),
                 user_prompt=(
-                    "Draft a reply email. Keep it practical and ready to send. "
-                    "Do not invent facts that are not in the original message or user notes.\n\n"
+                    "Draft a reply email body.\n"
+                    "- Output final answer text only.\n"
+                    "- No chain-of-thought, analysis, preamble, JSON, markdown, or code fences.\n"
+                    "- Keep it practical and ready to send.\n"
+                    "- Do not invent facts that are not in the original message or user notes.\n\n"
                     f"Original sender: {message.sender}\n"
                     f"Original subject: {message.subject}\n"
                     f"Original body:\n{message.body_text[:8000]}\n\n"
@@ -532,9 +538,10 @@ class YahooMailService:
                 on_partial=on_partial,
                 is_cancelled=is_cancelled,
             )
+            draft_text = self._normalize_draft_text(draft_text)
         except (AIUnavailableError, AIClientError) as exc:
             self._record("email_draft_reply", uid, "error", str(exc))
-            raise YahooMailError(str(exc)) from exc
+            raise YahooMailError(self._humanize_draft_error(exc)) from exc
         reply_subject = message.subject if message.subject.lower().startswith("re:") else f"Re: {message.subject}"
         self._record("email_draft_reply", uid, "success")
         return OutgoingDraft(
@@ -546,12 +553,17 @@ class YahooMailService:
     def draft_new_email(self, to_address: str, subject: str, user_notes: str, on_status=None, on_partial=None, is_cancelled=None) -> OutgoingDraft:
         settings = self._settings_store.load()
         try:
-            draft_text = self._ai_client.generate_text(
+            draft_text = self._ai_client.generate_final_text(
                 settings,
-                system_prompt="You draft clear, friendly outbound emails for a non-technical user.",
+                system_prompt=(
+                    "You draft clear, friendly outbound emails for a non-technical user. "
+                    "Return only directly-usable final email body text."
+                ),
                 user_prompt=(
-                    "Write a new email draft that the user can review and edit before sending. "
-                    "Keep it clear, specific, and not overly formal.\n\n"
+                    "Write a new email draft body.\n"
+                    "- Output final answer text only.\n"
+                    "- No chain-of-thought, analysis, preamble, JSON, markdown, or code fences.\n"
+                    "- Keep it clear, specific, and not overly formal.\n\n"
                     f"To: {to_address or 'Not specified yet'}\n"
                     f"Subject: {subject or 'Not specified yet'}\n"
                     f"What the user wants to say:\n{(user_notes or 'No notes provided.')[:4000]}"
@@ -560,11 +572,46 @@ class YahooMailService:
                 on_partial=on_partial,
                 is_cancelled=is_cancelled,
             )
+            draft_text = self._normalize_draft_text(draft_text)
         except (AIUnavailableError, AIClientError) as exc:
             self._record("email_draft_new", to_address or subject or "new", "error", str(exc))
-            raise YahooMailError(str(exc)) from exc
+            raise YahooMailError(self._humanize_draft_error(exc)) from exc
         self._record("email_draft_new", to_address or subject or "new", "success")
         return OutgoingDraft(to_address=to_address.strip(), subject=subject.strip(), body=draft_text)
+
+    def _normalize_draft_text(self, text: str) -> str:
+        normalized = text.strip()
+        if not normalized:
+            raise AIModelOutputError(
+                reason="empty_output",
+                message="The model returned an empty or whitespace-only final draft body.",
+            )
+        if normalized.startswith("```") or normalized.endswith("```"):
+            raise AIModelOutputError(
+                reason="malformed_content",
+                message="The model returned markdown fencing instead of directly-usable email body text.",
+            )
+        lowered = normalized.lower()
+        if lowered.startswith("{") and lowered.endswith("}"):
+            raise AIModelOutputError(
+                reason="malformed_content",
+                message="The model returned JSON instead of directly-usable email body text.",
+            )
+        return normalized
+
+    def _humanize_draft_error(self, exc: Exception) -> str:
+        if isinstance(exc, AITimeoutError):
+            return "Draft generation timed out before the model produced a usable final draft body."
+        if isinstance(exc, AIModelOutputError):
+            if exc.reason == "no_stream":
+                return "Draft generation failed because the local model returned no stream output."
+            if exc.reason == "reasoning_only_stream":
+                return "Draft generation failed because the local model produced reasoning only and no final draft body."
+            if exc.reason == "empty_output":
+                return "Draft generation failed because the model returned an empty final draft body."
+            if exc.reason == "malformed_content":
+                return "Draft generation failed because the model output was malformed for an email draft body."
+        return str(exc)
 
     def send_email(self, draft: OutgoingDraft) -> None:
         settings = self._settings_store.load()
