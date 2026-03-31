@@ -66,6 +66,29 @@ class AIWorkerTests(unittest.TestCase):
         self.assertIn("Traceback", payload["traceback"])
         self.assertEqual(finished_count, 1)
 
+    def test_worker_survives_failed_signal_handler_exceptions(self) -> None:
+        finished_count = 0
+
+        def task(on_status, on_partial, is_cancelled):  # noqa: ANN001
+            _ = on_status, on_partial, is_cancelled
+            raise RuntimeError("task exploded")
+
+        worker = AIWorker(task)
+
+        def _broken_failed_handler(_: object) -> None:
+            raise RuntimeError("downstream failed handler broke")
+
+        worker.failed.connect(_broken_failed_handler)
+
+        def _on_finished() -> None:
+            nonlocal finished_count
+            finished_count += 1
+
+        worker.finished.connect(_on_finished)
+        worker.run()
+
+        self.assertEqual(finished_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

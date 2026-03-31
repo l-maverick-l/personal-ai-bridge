@@ -25,9 +25,31 @@ class AIWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            result = self._task(self.status.emit, self.partial.emit, self._cancel_event.is_set)
+            result = self._task(self._emit_status, self._emit_partial, self._cancel_event.is_set)
             self.completed.emit(result)
         except Exception as exc:
+            self._emit_failure_payload(exc)
+        finally:
+            try:
+                self.finished.emit()
+            except Exception:
+                # Never let Qt signal edge cases terminate the worker thread.
+                pass
+
+    def _emit_status(self, text: str) -> None:
+        try:
+            self.status.emit(text)
+        except Exception as exc:
+            raise RuntimeError(f"status_emit_failed: {exc}") from exc
+
+    def _emit_partial(self, text: str) -> None:
+        try:
+            self.partial.emit(text)
+        except Exception as exc:
+            raise RuntimeError(f"partial_emit_failed: {exc}") from exc
+
+    def _emit_failure_payload(self, exc: Exception) -> None:
+        try:
             self.failed.emit(
                 {
                     "exception_type": type(exc).__name__,
@@ -35,5 +57,5 @@ class AIWorker(QObject):
                     "traceback": traceback.format_exc(),
                 }
             )
-        finally:
-            self.finished.emit()
+        except Exception:
+            pass
