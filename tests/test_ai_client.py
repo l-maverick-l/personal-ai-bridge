@@ -85,6 +85,18 @@ class AIClientOllamaTests(unittest.TestCase):
             client.generate_text(self.settings, "sys", "usr")
         self.assertEqual(ctx.exception.reason, "empty_output")
 
+    def test_generate_text_streams_progressive_partial_updates(self) -> None:
+        client = StubAIClient(
+            chunks_by_call=[[
+                {"message": {"content": "Hello"}},
+                {"message": {"content": " world"}},
+            ]]
+        )
+        partials: list[str] = []
+        output = client.generate_text(self.settings, "sys", "usr", on_partial=partials.append)
+        self.assertEqual(output, "Hello world")
+        self.assertEqual(partials, ["Hello", "Hello world"])
+
     def test_assistant_maps_reasoning_only_error(self) -> None:
         message = AssistantService._planner_error_from_exception(  # type: ignore[attr-defined]
             AssistantService,
