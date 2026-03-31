@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
@@ -82,6 +83,14 @@ class MainWindow(QMainWindow):
             self._context.ai_client,
         )
         self._assistant_proposals: list[AssistantActionProposal] = []
+        self._stream_flush_timer = QTimer(self)
+        self._stream_flush_timer.setInterval(80)
+        self._stream_flush_timer.timeout.connect(self._flush_stream_buffers)
+        self._pending_results_text: str | None = None
+        self._pending_draft_text: str | None = None
+        self._streaming_to_results = False
+        self._streaming_to_draft = False
+        self._last_draft_partial_text = ""
 
         self.setWindowTitle("Personal AI Bridge")
         self.resize(1500, 900)
@@ -680,11 +689,7 @@ class MainWindow(QMainWindow):
                 on_partial=on_partial,
                 is_cancelled=is_cancelled,
             ),
-            on_success=lambda draft: (
-                self._apply_draft(draft),
-                self._set_yahoo_draft_status("draft applied"),
-                self._show_result("Draft reply created. Review and edit it before sending."),
-            ),
+            on_success=self._on_draft_generation_success,
             stream_to_draft=True,
             on_status=self._on_yahoo_draft_status,
             on_failure=self._on_yahoo_draft_failure,
@@ -702,11 +707,7 @@ class MainWindow(QMainWindow):
                 on_partial=on_partial,
                 is_cancelled=is_cancelled,
             ),
-            on_success=lambda draft: (
-                self._apply_draft(draft),
-                self._set_yahoo_draft_status("draft applied"),
-                self._show_result("New email draft created. Review and edit it before sending."),
-            ),
+            on_success=self._on_draft_generation_success,
             stream_to_draft=True,
             on_status=self._on_yahoo_draft_status,
             on_failure=self._on_yahoo_draft_failure,
@@ -763,9 +764,14 @@ class MainWindow(QMainWindow):
     def _on_yahoo_draft_failure(self, failure) -> None:
         exc = self._failure_to_exception(failure)
         message = str(exc)
+        self._log_worker_failure("Yahoo draft generation", failure)
+        self._flush_stream_buffers()
         self._set_yahoo_draft_status(f"draft failed — {message}")
-        self.draft_body_input.setPlainText(f"[Draft generation failed]\n{message}")
-        self.results_output.setPlainText(message)
+        if not self.draft_body_input.toPlainText().strip() and self._last_draft_partial_text.strip():
+            self.draft_body_input.setPlainText(self._last_draft_partial_text)
+        self.results_output.setPlainText(f"Yahoo draft generation failed: {message}")
+        if self.assistant_output.toPlainText().strip():
+            self.assistant_output.appendPlainText(f"\n[Yahoo draft failed] {message}")
         self.refresh_ui()
 
     def _set_yahoo_draft_status(self, message: str) -> None:
@@ -1521,24 +1527,25 @@ class MainWindow(QMainWindow):
         if self._ai_thread and self._ai_thread.isRunning():
             self._show_result("Another AI task is still running. Cancel it or wait for it to finish.")
             return
+        self._prepare_stream_buffers(stream_to_results=stream_to_results, stream_to_draft=stream_to_draft)
         self.ai_progress_label.setText("AI status: Connecting to AI provider")
         self.cancel_ai_button.setEnabled(True)
 
         thread = QThread(self)
         worker = AIWorker(task)
         worker.moveToThread(thread)
-        worker.status.connect(lambda text: self.ai_progress_label.setText(f"AI status: {text}"))
+        worker.status.connect(self._on_worker_status)
         if on_status:
-            worker.status.connect(on_status)
+            worker.status.connect(lambda text: self._invoke_safe_ui_callback("status handler", on_status, text))
         if stream_to_results:
-            worker.partial.connect(lambda text: self.results_output.setPlainText(text))
+            worker.partial.connect(self._buffer_results_partial)
         if stream_to_draft:
-            worker.partial.connect(lambda text: self.draft_body_input.setPlainText(text))
-        worker.completed.connect(on_success)
+            worker.partial.connect(self._buffer_draft_partial)
+        worker.completed.connect(lambda result: self._invoke_safe_ui_callback(f"{task_name} success handler", on_success, result))
         if on_failure:
-            worker.failed.connect(on_failure)
+            worker.failed.connect(lambda error: self._invoke_safe_ui_callback(f"{task_name} failure handler", on_failure, error))
         else:
-            worker.failed.connect(lambda error: self._show_error(f"{task_name} failed", self._failure_to_exception(error)))
+            worker.failed.connect(lambda error: self._default_worker_failure(task_name, error))
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -1555,6 +1562,8 @@ class MainWindow(QMainWindow):
             self.ai_progress_label.setText("AI status: Cancelling request")
 
     def _reset_ai_task_state(self) -> None:
+        self._flush_stream_buffers()
+        self._stream_flush_timer.stop()
         self._ai_thread = None
         self._ai_worker = None
         self.cancel_ai_button.setEnabled(False)
@@ -1566,6 +1575,7 @@ class MainWindow(QMainWindow):
         self.refresh_ui()
 
     def _show_error(self, title: str, exc: Exception) -> None:
+        self._logger.exception("%s: %s", title, exc, exc_info=exc)
         self.results_output.setPlainText(str(exc))
         QMessageBox.warning(self, title, str(exc))
         self.refresh_ui()
@@ -1576,6 +1586,81 @@ class MainWindow(QMainWindow):
             message = str(failure.get("message") or "No error message was provided.")
             return RuntimeError(f"{exception_type}: {message}")
         return RuntimeError(str(failure))
+
+    def _on_draft_generation_success(self, draft: OutgoingDraft) -> None:
+        self._flush_stream_buffers()
+        self._set_yahoo_draft_status("applying draft")
+        self._apply_draft(draft)
+        self._set_yahoo_draft_status("draft ready")
+        self._show_result("Draft created. Review and edit it before sending.")
+
+    def _on_worker_status(self, text: str) -> None:
+        self.ai_progress_label.setText(f"AI status: {text}")
+
+    def _prepare_stream_buffers(self, stream_to_results: bool, stream_to_draft: bool) -> None:
+        self._streaming_to_results = stream_to_results
+        self._streaming_to_draft = stream_to_draft
+        self._pending_results_text = None
+        self._pending_draft_text = None
+        if stream_to_draft:
+            self._last_draft_partial_text = self.draft_body_input.toPlainText()
+
+    def _buffer_results_partial(self, text: str) -> None:
+        self._pending_results_text = text
+        self._schedule_stream_flush()
+
+    def _buffer_draft_partial(self, text: str) -> None:
+        self._pending_draft_text = text
+        self._last_draft_partial_text = text
+        self._schedule_stream_flush()
+
+    def _schedule_stream_flush(self) -> None:
+        if not self._stream_flush_timer.isActive():
+            self._stream_flush_timer.start()
+
+    def _flush_stream_buffers(self) -> None:
+        try:
+            if self._streaming_to_results and self._pending_results_text is not None:
+                self.results_output.setPlainText(self._pending_results_text)
+                self._pending_results_text = None
+            if self._streaming_to_draft and self._pending_draft_text is not None:
+                self.draft_body_input.setPlainText(self._pending_draft_text)
+                self._pending_draft_text = None
+        except Exception:
+            self._logger.exception("UI update error while applying streamed AI output")
+            self._set_yahoo_draft_status("draft failed — UI update error")
+            self.results_output.setPlainText(
+                "Draft generation failed while updating the editor UI. The app is still running; check logs for traceback."
+            )
+            self._stream_flush_timer.stop()
+        if self._pending_results_text is None and self._pending_draft_text is None:
+            self._stream_flush_timer.stop()
+
+    def _default_worker_failure(self, task_name: str, error) -> None:
+        self._log_worker_failure(task_name, error)
+        self._show_error(f"{task_name} failed", self._failure_to_exception(error))
+
+    def _invoke_safe_ui_callback(self, callback_name: str, callback, *args) -> None:
+        try:
+            callback(*args)
+        except Exception as exc:
+            self._logger.exception("Unhandled UI callback error in %s", callback_name)
+            self.results_output.setPlainText(
+                f"{callback_name} failed: {exc}\n\n{traceback.format_exc()}"
+            )
+            self._set_yahoo_draft_status("draft failed — UI callback error")
+
+    def _log_worker_failure(self, task_name: str, failure) -> None:
+        if isinstance(failure, dict):
+            self._logger.error(
+                "%s failed: type=%s message=%s\n%s",
+                task_name,
+                failure.get("exception_type", "Exception"),
+                failure.get("message", ""),
+                failure.get("traceback", ""),
+            )
+            return
+        self._logger.error("%s failed: %s", task_name, failure)
 
     def _set_pending_action(self, message: str, action: Callable[[], None]) -> None:
         self._pending_action = action
