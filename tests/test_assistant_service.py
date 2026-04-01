@@ -131,6 +131,7 @@ class AssistantServiceTests(unittest.TestCase):
     def test_root_folder_context_is_preserved(self) -> None:
         assistant = self._assistant_with_ai(
             [
+                '{"intent":"file","tool_calls":[{"name":"list_directory","arguments":{"relative_path":"."}}],"final_answer":"","proposed_actions":[],"needs_confirmation":false}',
                 '{"intent":"general","tool_calls":[],"final_answer":"Root summary.","proposed_actions":[],"needs_confirmation":false}',
             ]
         )
@@ -142,6 +143,91 @@ class AssistantServiceTests(unittest.TestCase):
         )
 
         self.assertIn("open folder (approved root)", response.used_context)
+
+
+    def test_send_email_always_requires_confirmation_even_on_full_auto(self) -> None:
+        assistant = self._assistant_with_ai([])
+        settings = self.store.load()
+        settings.execution_policy = "full_auto"
+
+        execution = assistant._execute_tool_call(
+            {
+                "name": "send_email",
+                "arguments": {
+                    "to_address": "friend@example.com",
+                    "subject": "Hi",
+                    "body": "Hello",
+                },
+            },
+            AssistantContext(selected_root=str(self.root)),
+            settings,
+        )
+
+        self.assertTrue(execution["ok"])
+        self.assertIn("proposal", execution)
+        self.assertEqual(execution["result"]["status"], "confirmation_required")
+        self.assertNotIn("executed_action", execution)
+
+    def test_list_inbox_accepts_start_and_end_dates(self) -> None:
+        assistant = self._assistant_with_ai([])
+        captured: dict[str, object] = {}
+
+        def _fake_list_inbox(**kwargs):  # noqa: ANN001
+            captured.update(kwargs)
+            return []
+
+        assistant._yahoo_service.list_inbox = _fake_list_inbox  # type: ignore[method-assign]
+        settings = self.store.load()
+
+        execution = assistant._execute_tool_call(
+            {
+                "name": "list_inbox",
+                "arguments": {
+                    "start_date": "2026-03-01",
+                    "end_date": "2026-03-31",
+                    "limit": 10,
+                },
+            },
+            AssistantContext(selected_root=str(self.root)),
+            settings,
+        )
+
+        self.assertTrue(execution["ok"])
+        self.assertEqual(str(captured["start_date"]), "2026-03-01")
+        self.assertEqual(str(captured["end_date"]), "2026-03-31")
+
+    def test_list_inbox_invalid_date_returns_clear_error(self) -> None:
+        assistant = self._assistant_with_ai([])
+
+        execution = assistant._execute_tool_call(
+            {
+                "name": "list_inbox",
+                "arguments": {
+                    "start_date": "03/01/2026",
+                },
+            },
+            AssistantContext(selected_root=str(self.root)),
+            self.store.load(),
+        )
+
+        self.assertFalse(execution["ok"])
+        self.assertIn("YYYY-MM-DD", execution["error"])
+
+    def test_factual_request_rejects_ungrounded_final_answer(self) -> None:
+        assistant = self._assistant_with_ai(
+            [
+                '{"intent":"email","tool_calls":[],"final_answer":"Your latest email says hello.","proposed_actions":[],"needs_confirmation":false}',
+                '{"intent":"email","tool_calls":[],"final_answer":"Still ungrounded.","proposed_actions":[],"needs_confirmation":false}',
+            ]
+        )
+
+        response = assistant.handle_request(
+            "What does my latest email say?",
+            AssistantContext(selected_root=str(self.root)),
+            self.store.load(),
+        )
+
+        self.assertIn("could not provide a grounded factual answer", response.answer_text)
 
     def test_status_updates_are_emitted_during_agent_flow(self) -> None:
         (self.root / "note.txt").write_text("hello", encoding="utf-8")

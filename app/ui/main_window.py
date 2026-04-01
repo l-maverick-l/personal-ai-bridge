@@ -51,6 +51,7 @@ from app.email.yahoo_service import MailMessageView, MailSummary, OutgoingDraft,
 from app.files.service import DirectoryListing, FileEntry, FileOperationError, FileReadResult
 from app.models.settings import AppSettings
 from app.ui.ai_worker import AIWorker
+from app.ui.draft_failure import build_draft_failure_update
 from app.ui.setup_wizard import SetupWizard
 
 
@@ -793,14 +794,17 @@ class MainWindow(QMainWindow):
         message = str(exc)
         self._log_worker_failure("Yahoo draft generation", failure)
         self._flush_stream_buffers()
-        self._set_yahoo_draft_status(f"draft failed — {message}")
-        self._set_yahoo_ai_status("failed")
-        if not self.draft_body_input.toPlainText().strip() and self._last_draft_partial_text.strip():
-            self.draft_body_input.setPlainText(self._last_draft_partial_text)
-        self.results_output.setPlainText(f"Yahoo draft generation failed: {message}")
-        if self.assistant_output.toPlainText().strip():
-            self.assistant_output.appendPlainText(f"\n[Yahoo draft failed] {message}")
-        self.refresh_ui()
+        update = build_draft_failure_update(
+            message=message,
+            existing_draft_body=self.draft_body_input.toPlainText(),
+            last_partial_draft=self._last_draft_partial_text,
+        )
+        self._set_yahoo_draft_status(update.draft_status)
+        self._set_yahoo_ai_status(update.yahoo_ai_status)
+        if update.fallback_draft_body is not None:
+            self.draft_body_input.setPlainText(update.fallback_draft_body)
+        self.results_output.setPlainText(update.results_text)
+        self._append_assistant_entry("System", update.assistant_note)
 
     def _set_yahoo_draft_status(self, message: str) -> None:
         self.yahoo_draft_status_label.setText(f"Draft status: {message}")
@@ -1627,13 +1631,11 @@ class MainWindow(QMainWindow):
 
     def _show_result(self, message: str) -> None:
         self.results_output.setPlainText(message)
-        self.refresh_ui()
 
     def _show_error(self, title: str, exc: Exception) -> None:
         self._logger.exception("%s: %s", title, exc, exc_info=exc)
         self.results_output.setPlainText(str(exc))
         QMessageBox.warning(self, title, str(exc))
-        self.refresh_ui()
 
     def _failure_to_exception(self, failure) -> Exception:
         if isinstance(failure, dict):
