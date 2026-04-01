@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date
 from dataclasses import dataclass, field
 from enum import Enum
 from collections.abc import Callable
@@ -98,6 +99,7 @@ class AssistantService:
         steps: list[_AgentStep] = []
         proposals: list[AssistantActionProposal] = []
         executed_actions: list[str] = []
+        grounding_retry_used = False
 
         for index in range(self._MAX_AGENT_STEPS):
             emit_status("planning tools")
@@ -132,6 +134,33 @@ class AssistantService:
                 continue
 
             if final_answer:
+                if self._requires_grounded_answer(request_text) and not self._has_grounding_evidence(steps):
+                    if not grounding_retry_used:
+                        grounding_retry_used = True
+                        steps.append(
+                            _AgentStep(
+                                tool_name="grounding_guardrail",
+                                args={},
+                                result={
+                                    "ok": False,
+                                    "error": (
+                                        "Ungrounded final_answer rejected. Run summarize/read tools for factual "
+                                        "file/email requests before answering."
+                                    ),
+                                },
+                            )
+                        )
+                        continue
+                    return AssistantResponse(
+                        intent=AssistantIntent.AGENT,
+                        answer_text=(
+                            "I could not provide a grounded factual answer. Please retry and allow me to read or summarize "
+                            "the relevant file/email first."
+                        ),
+                        executed_actions=executed_actions,
+                        proposed_actions=proposals,
+                        used_context=used_context,
+                    )
                 emit_status("generating final answer")
                 return AssistantResponse(
                     intent=AssistantIntent.AGENT,
@@ -573,10 +602,16 @@ class AssistantService:
                 else:
                     unread_only = None
                 limit = int(args.get("limit", 25))
+                start_date = self._parse_optional_iso_date(args.get("start_date"), field_name="start_date")
+                end_date = self._parse_optional_iso_date(args.get("end_date"), field_name="end_date")
+                if start_date and end_date and start_date > end_date:
+                    raise ValueError("start_date must be on or before end_date.")
                 messages = self._yahoo_service.list_inbox(
                     unread_only=unread_only,
                     sender=str(args.get("sender", "")),
                     subject_keyword=str(args.get("subject_keyword", "")),
+                    start_date=start_date,
+                    end_date=end_date,
                     limit=max(1, min(limit, 50)),
                 )
                 return {
@@ -660,15 +695,6 @@ class AssistantService:
                 subject = str(args.get("subject", "")).strip()
                 body = str(args.get("body", "")).strip()
                 use_current = bool(args.get("use_current_draft", False))
-                if self._can_auto_execute(tool_name, settings=settings) and not use_current:
-                    self._yahoo_service.send_email(OutgoingDraft(to_address=to_address, subject=subject, body=body))
-                    return {
-                        "ok": True,
-                        "tool_name": tool_name,
-                        "args": args,
-                        "executed_action": f"Sent email to {to_address}",
-                        "result": {"status": "sent"},
-                    }
                 parameters = {"use_current_draft": "true"} if use_current else {
                     "to": to_address,
                     "subject": subject,
@@ -698,8 +724,10 @@ class AssistantService:
             return True
         if tool_name in {"create_file", "rename_file", "copy_file", "move_file"}:
             return policy in {"trusted_roots_auto", "full_auto"}
-        if tool_name in {"delete_file", "send_email"}:
+        if tool_name == "delete_file":
             return policy == "full_auto"
+        if tool_name == "send_email":
+            return False
         if tool_name in {"add_approved_root", "remove_approved_root"}:
             return policy in {"trusted_roots_auto", "full_auto"}
         return False
@@ -736,6 +764,35 @@ class AssistantService:
         if not value:
             raise ValueError(f"Missing required path: {arg_key}")
         return value
+
+
+    def _parse_optional_iso_date(self, raw_value: Any, field_name: str) -> date | None:
+        value = str(raw_value or "").strip()
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must use YYYY-MM-DD format.") from exc
+
+    def _requires_grounded_answer(self, request_text: str) -> bool:
+        lowered = request_text.lower()
+        action_tokens = ("delete", "move", "rename", "create", "copy", "send", "draft")
+        if any(token in lowered for token in action_tokens):
+            return False
+        factual_tokens = (
+            "email", "inbox", "message", "sender", "subject", "file", "document", "read", "summarize", "summary", "what"
+        )
+        return any(token in lowered for token in factual_tokens)
+
+    def _has_grounding_evidence(self, steps: list[_AgentStep]) -> bool:
+        grounding_tools = {"read_email", "summarize_email", "read_file", "summarize_file", "list_inbox", "list_directory", "search_files"}
+        for step in steps:
+            if step.tool_name not in grounding_tools:
+                continue
+            if isinstance(step.result, dict) and step.result.get("ok"):
+                return True
+        return False
 
     def _context_labels(self, context: AssistantContext) -> list[str]:
         labels: list[str] = []
