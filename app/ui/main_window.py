@@ -115,15 +115,15 @@ class MainWindow(QMainWindow):
 
         central_widget = QWidget()
         layout = QVBoxLayout(central_widget)
-        splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = QSplitter(Qt.Horizontal)
 
-        splitter.addWidget(self._build_left_sidebar())
-        splitter.addWidget(self._build_center_panel())
-        splitter.addWidget(self._build_preview_panel())
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 1)
+        self.main_splitter.addWidget(self._build_left_sidebar())
+        self.main_splitter.addWidget(self._build_center_panel())
+        self.main_splitter.addWidget(self._build_preview_panel())
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 1)
 
-        layout.addWidget(splitter)
+        layout.addWidget(self.main_splitter)
         self.setCentralWidget(central_widget)
 
         self.refresh_ui()
@@ -186,6 +186,16 @@ class MainWindow(QMainWindow):
         quick_layout.addWidget(refresh_mail_button)
         quick_layout.addWidget(test_ai_button)
 
+        assistant_shell_group = QGroupBox("Assistant shell")
+        assistant_shell_layout = QVBoxLayout(assistant_shell_group)
+        self.always_on_top_checkbox = QCheckBox("Keep app window always on top")
+        self.compact_mode_checkbox = QCheckBox("Compact layout (focus on assistant)")
+        save_shell_preferences_button = QPushButton("Save shell preferences")
+        save_shell_preferences_button.clicked.connect(self.save_assistant_shell_preferences)
+        assistant_shell_layout.addWidget(self.always_on_top_checkbox)
+        assistant_shell_layout.addWidget(self.compact_mode_checkbox)
+        assistant_shell_layout.addWidget(save_shell_preferences_button)
+
         recent_group = QGroupBox("Recent actions")
         recent_layout = QVBoxLayout(recent_group)
         self.recent_commands = QListWidget()
@@ -194,6 +204,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(status_group)
         layout.addWidget(folders_group)
         layout.addWidget(quick_actions)
+        layout.addWidget(assistant_shell_group)
         layout.addWidget(recent_group)
         return widget
 
@@ -450,6 +461,8 @@ class MainWindow(QMainWindow):
         assistant_layout = QVBoxLayout(assistant_group)
         self.assistant_status_label = QLabel("Assistant status: idle")
         self.assistant_status_label.setWordWrap(True)
+        self.assistant_policy_label = QLabel("Assistant policy: loading...")
+        self.assistant_policy_label.setWordWrap(True)
         self.assistant_history = QTextBrowser()
         self.assistant_history.setHtml("<p><b>Primary workflow:</b> ask here in plain English and I will choose safe file/email tools for you.</p>")
         self.assistant_input = QPlainTextEdit()
@@ -464,6 +477,7 @@ class MainWindow(QMainWindow):
         assistant_buttons.addWidget(apply_button)
 
         assistant_layout.addWidget(self.assistant_status_label)
+        assistant_layout.addWidget(self.assistant_policy_label)
         assistant_layout.addWidget(self.assistant_history)
         assistant_layout.addWidget(self.assistant_input)
         assistant_layout.addLayout(assistant_buttons)
@@ -557,6 +571,10 @@ class MainWindow(QMainWindow):
         model_name = self._settings.provider.model_name or "No model selected"
         self.provider_status_label.setText(f"Provider/model: {provider_label} / {model_name}")
         self._restore_combo_value(self.execution_policy_selector, self._settings.execution_policy, role=Qt.ItemDataRole.UserRole)
+        self.always_on_top_checkbox.setChecked(self._settings.assistant_always_on_top)
+        self.compact_mode_checkbox.setChecked(self._settings.assistant_compact_mode)
+        self._apply_assistant_shell_preferences()
+        self._update_assistant_policy_label()
 
         self.yahoo_email_input.setText(self._settings.yahoo_email)
         self.yahoo_password_input.setText(self._settings.yahoo_app_password)
@@ -1547,7 +1565,35 @@ class MainWindow(QMainWindow):
         policy = self.execution_policy_selector.currentData(Qt.ItemDataRole.UserRole) or "confirm_destructive_external"
         self._settings.execution_policy = str(policy)
         self._context.settings_store.save(self._settings)
+        self._update_assistant_policy_label()
         self._show_result(f"Saved execution policy: {policy}")
+
+    def save_assistant_shell_preferences(self) -> None:
+        self._settings.assistant_always_on_top = self.always_on_top_checkbox.isChecked()
+        self._settings.assistant_compact_mode = self.compact_mode_checkbox.isChecked()
+        self._context.settings_store.save(self._settings)
+        self._apply_assistant_shell_preferences()
+        self._show_result("Saved assistant shell preferences.")
+
+    def _apply_assistant_shell_preferences(self) -> None:
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self._settings.assistant_always_on_top)
+        self.show()
+        if self._settings.assistant_compact_mode:
+            self.main_splitter.setSizes([0, 1400, 0])
+        else:
+            self.main_splitter.setSizes([360, 800, 360])
+
+    def _update_assistant_policy_label(self) -> None:
+        policy = (self._settings.execution_policy or "confirm_destructive_external").strip()
+        if policy == "read_only_auto":
+            summary = "read/list/search run automatically; all write actions require confirmation."
+        elif policy == "trusted_roots_auto":
+            summary = "trusted file writes auto-run; delete and high-risk actions require confirmation."
+        elif policy == "full_auto":
+            summary = "all supported local file actions can auto-run; review requests carefully."
+        else:
+            summary = "destructive/external actions require confirmation; safest balanced default."
+        self.assistant_policy_label.setText(f"Assistant policy: {policy} — {summary}")
 
     def test_ai_provider(self) -> None:
         result = self._context.ai_client.test_provider(self._settings)
