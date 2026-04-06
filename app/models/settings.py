@@ -42,6 +42,8 @@ class AppSettings:
     ai_local_timeout_seconds: int = 180
     ai_cloud_timeout_seconds: int = 45
     execution_policy: str = "confirm_destructive_external"
+    assistant_always_on_top: bool = False
+    assistant_compact_mode: bool = False
     setup_complete: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +66,8 @@ class AppSettings:
             ai_local_timeout_seconds=int(payload.get("ai_local_timeout_seconds", 180) or 180),
             ai_cloud_timeout_seconds=int(payload.get("ai_cloud_timeout_seconds", 45) or 45),
             execution_policy=payload.get("execution_policy", "confirm_destructive_external"),
+            assistant_always_on_top=bool(payload.get("assistant_always_on_top", False)),
+            assistant_compact_mode=bool(payload.get("assistant_compact_mode", False)),
             setup_complete=bool(payload.get("setup_complete", False)),
         )
 

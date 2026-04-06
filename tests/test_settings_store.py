@@ -28,6 +28,8 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(settings.provider.provider_type, "none")
         self.assertEqual(settings.yahoo_imap_server, "imap.mail.yahoo.com")
         self.assertEqual(settings.yahoo_smtp_port, 465)
+        self.assertFalse(settings.assistant_always_on_top)
+        self.assertFalse(settings.assistant_compact_mode)
 
     def test_save_and_load_round_trip(self) -> None:
         expected = AppSettings(
@@ -46,6 +48,8 @@ class SettingsStoreTests(unittest.TestCase):
             yahoo_imap_port=993,
             yahoo_smtp_server="smtp.mail.yahoo.com",
             yahoo_smtp_port=465,
+            assistant_always_on_top=True,
+            assistant_compact_mode=True,
             setup_complete=True,
         )
         self.store.save(expected)
@@ -58,6 +62,8 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(actual.yahoo_email, expected.yahoo_email)
         self.assertEqual(actual.yahoo_imap_port, expected.yahoo_imap_port)
         self.assertEqual(actual.yahoo_smtp_server, expected.yahoo_smtp_server)
+        self.assertTrue(actual.assistant_always_on_top)
+        self.assertTrue(actual.assistant_compact_mode)
         self.assertTrue(actual.setup_complete)
 
     def test_store_can_be_used_from_worker_thread(self) -> None:
