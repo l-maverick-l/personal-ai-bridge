@@ -468,6 +468,14 @@ class MainWindow(QMainWindow):
         self.assistant_input = QPlainTextEdit()
         self.assistant_input.setPlaceholderText("Example: 'Find files mentioning invoice', 'Summarize the selected email', or 'Move the selected file to Taxes/2026'.")
         self.assistant_input.setMaximumHeight(100)
+        quick_setup_row = QHBoxLayout()
+        connect_folder_button = QPushButton("Connect folder…")
+        connect_folder_button.clicked.connect(self._prompt_add_folder_for_copilot)
+        connect_yahoo_button = QPushButton("Connect Yahoo…")
+        connect_yahoo_button.clicked.connect(self.run_setup_wizard)
+        quick_setup_row.addWidget(connect_folder_button)
+        quick_setup_row.addWidget(connect_yahoo_button)
+        quick_setup_row.addStretch(1)
         assistant_buttons = QHBoxLayout()
         send_button = QPushButton("Send to assistant")
         send_button.clicked.connect(self.run_assistant_request)
@@ -480,6 +488,7 @@ class MainWindow(QMainWindow):
         assistant_layout.addWidget(self.assistant_policy_label)
         assistant_layout.addWidget(self.assistant_history)
         assistant_layout.addWidget(self.assistant_input)
+        assistant_layout.addLayout(quick_setup_row)
         assistant_layout.addLayout(assistant_buttons)
 
         proposals_group = QGroupBox("Proposed actions")
@@ -1348,6 +1357,8 @@ class MainWindow(QMainWindow):
         if not request_text:
             self._show_result("Type an assistant request first.")
             return
+        if not self._prepare_minimum_context_for_request(request_text):
+            return
         if self._ai_thread and self._ai_thread.isRunning():
             self._show_result("Another AI task is running. Wait or cancel it before sending a new assistant request.")
             return
@@ -1440,6 +1451,76 @@ class MainWindow(QMainWindow):
             self._append_assistant_entry("Assistant", f"Queued action:\n{proposal_to_json(proposal)}")
         except Exception as exc:
             self._show_error("Could not queue assistant action", exc)
+
+    def _prepare_minimum_context_for_request(self, request_text: str) -> bool:
+        if self._looks_like_file_request(request_text) and not self._context.folder_registry.list_folders():
+            reply = QMessageBox.question(
+                self,
+                "Connect a folder",
+                "This request looks file-related, but no approved folder is configured yet.\n\nAdd a folder now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                if not self._prompt_add_folder_for_copilot():
+                    self._show_result("No folder added yet. Assistant request canceled.")
+                    return False
+            else:
+                self._show_result("Assistant request canceled. Connect a folder first.")
+                return False
+        if self._looks_like_email_request(request_text) and not self._settings.yahoo_is_configured():
+            reply = QMessageBox.question(
+                self,
+                "Connect Yahoo Mail",
+                "This request looks email-related, but Yahoo Mail is not configured.\n\nOpen setup now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.run_setup_wizard()
+                self._settings = self._context.settings_store.load()
+                if not self._settings.yahoo_is_configured():
+                    self._show_result("Yahoo is still not configured. Assistant request canceled.")
+                    return False
+            else:
+                self._show_result("Assistant request canceled. Connect Yahoo first.")
+                return False
+        return True
+
+    def _prompt_add_folder_for_copilot(self) -> bool:
+        folder = QFileDialog.getExistingDirectory(self, "Choose approved folder")
+        if not folder:
+            return False
+        try:
+            normalized = self._context.file_service.add_allowed_root(folder)
+            self.refresh_ui()
+            self._show_result(f"Connected folder: {normalized}")
+            return True
+        except Exception as exc:
+            self._show_error("Could not add approved folder", exc)
+            return False
+
+    def _looks_like_file_request(self, request_text: str) -> bool:
+        lowered = request_text.lower()
+        tokens = (
+            "file",
+            "folder",
+            "directory",
+            "document",
+            "pdf",
+            "copy",
+            "move",
+            "delete",
+            "rename",
+            "create",
+            "search",
+        )
+        return any(token in lowered for token in tokens)
+
+    def _looks_like_email_request(self, request_text: str) -> bool:
+        lowered = request_text.lower()
+        tokens = ("email", "mail", "inbox", "reply", "draft", "yahoo")
+        return any(token in lowered for token in tokens)
 
     def _queue_assistant_action(self, proposal: AssistantActionProposal) -> None:
         if proposal.action_type == "approved_root_add":
