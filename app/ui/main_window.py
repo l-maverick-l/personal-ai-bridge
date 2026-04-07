@@ -115,15 +115,15 @@ class MainWindow(QMainWindow):
 
         central_widget = QWidget()
         layout = QVBoxLayout(central_widget)
-        splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = QSplitter(Qt.Horizontal)
 
-        splitter.addWidget(self._build_left_sidebar())
-        splitter.addWidget(self._build_center_panel())
-        splitter.addWidget(self._build_preview_panel())
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 1)
+        self.main_splitter.addWidget(self._build_left_sidebar())
+        self.main_splitter.addWidget(self._build_center_panel())
+        self.main_splitter.addWidget(self._build_preview_panel())
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 1)
 
-        layout.addWidget(splitter)
+        layout.addWidget(self.main_splitter)
         self.setCentralWidget(central_widget)
 
         self.refresh_ui()
@@ -186,6 +186,16 @@ class MainWindow(QMainWindow):
         quick_layout.addWidget(refresh_mail_button)
         quick_layout.addWidget(test_ai_button)
 
+        assistant_shell_group = QGroupBox("Assistant shell")
+        assistant_shell_layout = QVBoxLayout(assistant_shell_group)
+        self.always_on_top_checkbox = QCheckBox("Keep app window always on top")
+        self.compact_mode_checkbox = QCheckBox("Compact layout (focus on assistant)")
+        save_shell_preferences_button = QPushButton("Save shell preferences")
+        save_shell_preferences_button.clicked.connect(self.save_assistant_shell_preferences)
+        assistant_shell_layout.addWidget(self.always_on_top_checkbox)
+        assistant_shell_layout.addWidget(self.compact_mode_checkbox)
+        assistant_shell_layout.addWidget(save_shell_preferences_button)
+
         recent_group = QGroupBox("Recent actions")
         recent_layout = QVBoxLayout(recent_group)
         self.recent_commands = QListWidget()
@@ -194,6 +204,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(status_group)
         layout.addWidget(folders_group)
         layout.addWidget(quick_actions)
+        layout.addWidget(assistant_shell_group)
         layout.addWidget(recent_group)
         return widget
 
@@ -450,11 +461,21 @@ class MainWindow(QMainWindow):
         assistant_layout = QVBoxLayout(assistant_group)
         self.assistant_status_label = QLabel("Assistant status: idle")
         self.assistant_status_label.setWordWrap(True)
+        self.assistant_policy_label = QLabel("Assistant policy: loading...")
+        self.assistant_policy_label.setWordWrap(True)
         self.assistant_history = QTextBrowser()
         self.assistant_history.setHtml("<p><b>Primary workflow:</b> ask here in plain English and I will choose safe file/email tools for you.</p>")
         self.assistant_input = QPlainTextEdit()
         self.assistant_input.setPlaceholderText("Example: 'Find files mentioning invoice', 'Summarize the selected email', or 'Move the selected file to Taxes/2026'.")
         self.assistant_input.setMaximumHeight(100)
+        quick_setup_row = QHBoxLayout()
+        connect_folder_button = QPushButton("Connect folder…")
+        connect_folder_button.clicked.connect(self._prompt_add_folder_for_copilot)
+        connect_yahoo_button = QPushButton("Connect Yahoo…")
+        connect_yahoo_button.clicked.connect(self.run_setup_wizard)
+        quick_setup_row.addWidget(connect_folder_button)
+        quick_setup_row.addWidget(connect_yahoo_button)
+        quick_setup_row.addStretch(1)
         assistant_buttons = QHBoxLayout()
         send_button = QPushButton("Send to assistant")
         send_button.clicked.connect(self.run_assistant_request)
@@ -464,8 +485,10 @@ class MainWindow(QMainWindow):
         assistant_buttons.addWidget(apply_button)
 
         assistant_layout.addWidget(self.assistant_status_label)
+        assistant_layout.addWidget(self.assistant_policy_label)
         assistant_layout.addWidget(self.assistant_history)
         assistant_layout.addWidget(self.assistant_input)
+        assistant_layout.addLayout(quick_setup_row)
         assistant_layout.addLayout(assistant_buttons)
 
         proposals_group = QGroupBox("Proposed actions")
@@ -557,6 +580,10 @@ class MainWindow(QMainWindow):
         model_name = self._settings.provider.model_name or "No model selected"
         self.provider_status_label.setText(f"Provider/model: {provider_label} / {model_name}")
         self._restore_combo_value(self.execution_policy_selector, self._settings.execution_policy, role=Qt.ItemDataRole.UserRole)
+        self.always_on_top_checkbox.setChecked(self._settings.assistant_always_on_top)
+        self.compact_mode_checkbox.setChecked(self._settings.assistant_compact_mode)
+        self._apply_assistant_shell_preferences()
+        self._update_assistant_policy_label()
 
         self.yahoo_email_input.setText(self._settings.yahoo_email)
         self.yahoo_password_input.setText(self._settings.yahoo_app_password)
@@ -1330,6 +1357,8 @@ class MainWindow(QMainWindow):
         if not request_text:
             self._show_result("Type an assistant request first.")
             return
+        if not self._prepare_minimum_context_for_request(request_text):
+            return
         if self._ai_thread and self._ai_thread.isRunning():
             self._show_result("Another AI task is running. Wait or cancel it before sending a new assistant request.")
             return
@@ -1422,6 +1451,76 @@ class MainWindow(QMainWindow):
             self._append_assistant_entry("Assistant", f"Queued action:\n{proposal_to_json(proposal)}")
         except Exception as exc:
             self._show_error("Could not queue assistant action", exc)
+
+    def _prepare_minimum_context_for_request(self, request_text: str) -> bool:
+        if self._looks_like_file_request(request_text) and not self._context.folder_registry.list_folders():
+            reply = QMessageBox.question(
+                self,
+                "Connect a folder",
+                "This request looks file-related, but no approved folder is configured yet.\n\nAdd a folder now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                if not self._prompt_add_folder_for_copilot():
+                    self._show_result("No folder added yet. Assistant request canceled.")
+                    return False
+            else:
+                self._show_result("Assistant request canceled. Connect a folder first.")
+                return False
+        if self._looks_like_email_request(request_text) and not self._settings.yahoo_is_configured():
+            reply = QMessageBox.question(
+                self,
+                "Connect Yahoo Mail",
+                "This request looks email-related, but Yahoo Mail is not configured.\n\nOpen setup now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.run_setup_wizard()
+                self._settings = self._context.settings_store.load()
+                if not self._settings.yahoo_is_configured():
+                    self._show_result("Yahoo is still not configured. Assistant request canceled.")
+                    return False
+            else:
+                self._show_result("Assistant request canceled. Connect Yahoo first.")
+                return False
+        return True
+
+    def _prompt_add_folder_for_copilot(self) -> bool:
+        folder = QFileDialog.getExistingDirectory(self, "Choose approved folder")
+        if not folder:
+            return False
+        try:
+            normalized = self._context.file_service.add_allowed_root(folder)
+            self.refresh_ui()
+            self._show_result(f"Connected folder: {normalized}")
+            return True
+        except Exception as exc:
+            self._show_error("Could not add approved folder", exc)
+            return False
+
+    def _looks_like_file_request(self, request_text: str) -> bool:
+        lowered = request_text.lower()
+        tokens = (
+            "file",
+            "folder",
+            "directory",
+            "document",
+            "pdf",
+            "copy",
+            "move",
+            "delete",
+            "rename",
+            "create",
+            "search",
+        )
+        return any(token in lowered for token in tokens)
+
+    def _looks_like_email_request(self, request_text: str) -> bool:
+        lowered = request_text.lower()
+        tokens = ("email", "mail", "inbox", "reply", "draft", "yahoo")
+        return any(token in lowered for token in tokens)
 
     def _queue_assistant_action(self, proposal: AssistantActionProposal) -> None:
         if proposal.action_type == "approved_root_add":
@@ -1547,7 +1646,35 @@ class MainWindow(QMainWindow):
         policy = self.execution_policy_selector.currentData(Qt.ItemDataRole.UserRole) or "confirm_destructive_external"
         self._settings.execution_policy = str(policy)
         self._context.settings_store.save(self._settings)
+        self._update_assistant_policy_label()
         self._show_result(f"Saved execution policy: {policy}")
+
+    def save_assistant_shell_preferences(self) -> None:
+        self._settings.assistant_always_on_top = self.always_on_top_checkbox.isChecked()
+        self._settings.assistant_compact_mode = self.compact_mode_checkbox.isChecked()
+        self._context.settings_store.save(self._settings)
+        self._apply_assistant_shell_preferences()
+        self._show_result("Saved assistant shell preferences.")
+
+    def _apply_assistant_shell_preferences(self) -> None:
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self._settings.assistant_always_on_top)
+        self.show()
+        if self._settings.assistant_compact_mode:
+            self.main_splitter.setSizes([0, 1400, 0])
+        else:
+            self.main_splitter.setSizes([360, 800, 360])
+
+    def _update_assistant_policy_label(self) -> None:
+        policy = (self._settings.execution_policy or "confirm_destructive_external").strip()
+        if policy == "read_only_auto":
+            summary = "read/list/search run automatically; all write actions require confirmation."
+        elif policy == "trusted_roots_auto":
+            summary = "trusted file writes auto-run; delete and high-risk actions require confirmation."
+        elif policy == "full_auto":
+            summary = "all supported local file actions can auto-run; review requests carefully."
+        else:
+            summary = "destructive/external actions require confirmation; safest balanced default."
+        self.assistant_policy_label.setText(f"Assistant policy: {policy} — {summary}")
 
     def test_ai_provider(self) -> None:
         result = self._context.ai_client.test_provider(self._settings)
